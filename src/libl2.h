@@ -62,7 +62,8 @@ inline constexpr size_t   KEY_SIZE           = 32;       // ChaCha20 key size
 inline constexpr size_t   DEFAULT_MAX_PAD    = 8;        // max random padding bytes
 
 using Mac = std::array<uint8_t, 6>;
-inline constexpr Mac BROADCAST_MAC = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+inline constexpr Mac BROADCAST_MAC       = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+inline constexpr Mac GOOSE_MULTICAST_MAC = {0x01, 0x0C, 0xCD, 0x01, 0x00, 0x01};
 
 enum class MsgType : uint8_t {
     Text    = 0x01,
@@ -82,6 +83,18 @@ struct DiscoveredPeer {
     Mac         mac{};
     std::string name;
 };
+
+inline std::string extract_node_name(const std::vector<uint8_t>& data) {
+    if (data.size() >= 11) {
+        uint16_t nlen = (uint16_t(data[9]) << 8) | data[10];
+        if (data.size() >= 11 + nlen) {
+            return std::string(data.begin() + 11, data.begin() + 11 + nlen);
+        }
+    } else if (data.size() > 1) {
+        return std::string(data.begin() + 1, data.end());
+    }
+    return "unknown";
+}
 
 enum class MsgFlags : uint8_t {
     None = 0x00,
@@ -190,6 +203,18 @@ inline std::string extract_guid(const std::string& s) {
     if (a != std::string::npos && b != std::string::npos)
         return s.substr(a + 1, b - a - 1);
     return s;
+}
+
+inline uint16_t get_key_appid(const uint8_t key[KEY_SIZE]) {
+    uint32_t h = fnv1a(key, KEY_SIZE);
+    uint16_t id = uint16_t(h & 0x3FFF);
+    return id == 0 ? 0x0001 : id;
+}
+
+inline Mac get_key_multicast_mac(const uint8_t key[KEY_SIZE]) {
+    uint32_t h = fnv1a(key, KEY_SIZE);
+    uint16_t offset = uint16_t(h & 0x01FF);
+    return Mac{0x01, 0x0C, 0xCD, 0x01, uint8_t(offset >> 8), uint8_t(offset & 0xFF)};
 }
 
 } // namespace detail
@@ -465,7 +490,8 @@ inline size_t build(const Mac& dst, const Mac& src,
     std::memcpy(p, src.data(), 6); p += 6;
     detail::write_be16(p, ETHER_TYPE); p += 2;
 
-    detail::write_be16(p, FRAME_MAGIC); p += 2;
+    uint16_t appid = detail::get_key_appid(key);
+    detail::write_be16(p, appid); p += 2;
 
     uint8_t nonce[NONCE_SIZE];
     std::uniform_int_distribution<uint32_t> byte_dist(0, 255);
@@ -517,8 +543,9 @@ inline bool parse(const uint8_t* frame, size_t frame_len,
     if (detail::read_be16(p) != ETHER_TYPE) return false;
     p += 2;
 
-    if (detail::read_be16(p) != FRAME_MAGIC) return false;
-    p += 2;
+    uint16_t frame_appid = detail::read_be16(p); p += 2;
+    uint16_t expected_appid = detail::get_key_appid(key);
+    if (frame_appid != expected_appid && frame_appid != FRAME_MAGIC) return false;
 
     uint8_t nonce[NONCE_SIZE];
     std::memcpy(nonce, p, NONCE_SIZE); p += NONCE_SIZE;
@@ -813,31 +840,72 @@ public:
         if (!open_) { last_error_ = "Channel not open"; return peers; }
 
         std::string req_name = request_name.empty() ? cfg_.node_name : request_name;
+
+        // Generate 64-bit random challenge cookie for anti-replay & session uniqueness
+        uint64_t cookie = (uint64_t(rng_()) << 32) | rng_();
+
+        // Dynamic random padding (32 to 96 bytes) to eliminate fixed-size signatures
+        std::uniform_int_distribution<size_t> pad_dist(32, 96);
+        size_t pad_len = pad_dist(rng_);
+
         std::vector<uint8_t> req;
+        req.reserve(1 + 8 + 2 + req_name.size() + 2 + pad_len);
         req.push_back(uint8_t(ControlCmd::DiscoveryRequest));
+
+        // 8-byte challenge cookie (big endian)
+        for (int i = 7; i >= 0; --i) req.push_back(uint8_t((cookie >> (i * 8)) & 0xFF));
+
+        // 2-byte node name length + node name
+        uint16_t nlen = uint16_t(req_name.size());
+        req.push_back(uint8_t(nlen >> 8));
+        req.push_back(uint8_t(nlen & 0xFF));
         req.insert(req.end(), req_name.begin(), req_name.end());
 
-        if (!send_to(BROADCAST_MAC, req.data(), req.size(), MsgType::Control))
+        // 2-byte random padding length + padding bytes
+        req.push_back(uint8_t(pad_len >> 8));
+        req.push_back(uint8_t(pad_len & 0xFF));
+        for (size_t i = 0; i < pad_len; ++i) req.push_back(uint8_t(rng_() & 0xFF));
+
+        // Transmit discovery beacon to key-derived IEC 61850 GOOSE multicast address
+        Mac dst_multicast = detail::get_key_multicast_mac(cfg_.key);
+        if (!send_to(dst_multicast, req.data(), req.size(), MsgType::Control))
             return peers;
 
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        bool fallback_broadcast_sent = false;
+
         while (std::chrono::steady_clock::now() < deadline) {
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count();
             if (remaining <= 0) break;
 
+            // In case a switch blocks non-IP multicast, send fallback broadcast at midpoint
+            if (peers.empty() && !fallback_broadcast_sent && remaining < timeout_ms / 2) {
+                send_to(BROADCAST_MAC, req.data(), req.size(), MsgType::Control);
+                fallback_broadcast_sent = true;
+            }
+
             int step_timeout = int(std::min<int64_t>(remaining, 50));
             auto msg = recv(step_timeout);
             if (msg.has_value() && msg->type == MsgType::Control && !msg->data.empty()) {
                 if (msg->data[0] == uint8_t(ControlCmd::DiscoveryResponse)) {
+                    // Validate challenge cookie if present
+                    if (msg->data.size() >= 9) {
+                        uint64_t resp_cookie = 0;
+                        for (int i = 0; i < 8; ++i) {
+                            resp_cookie = (resp_cookie << 8) | msg->data[1 + i];
+                        }
+                        if (resp_cookie != cookie && resp_cookie != 0) {
+                            continue;
+                        }
+                    }
+
                     auto it = std::find_if(peers.begin(), peers.end(),
                         [&](const DiscoveredPeer& p) { return p.mac == msg->sender_mac; });
                     if (it == peers.end()) {
                         DiscoveredPeer p;
                         p.mac = msg->sender_mac;
-                        if (msg->data.size() > 1) {
-                            p.name.assign(msg->data.begin() + 1, msg->data.end());
-                        }
+                        p.name = extract_node_name(msg->data);
                         peers.push_back(std::move(p));
                     }
                 }
@@ -881,16 +949,47 @@ public:
             Mac dst;
             std::memcpy(dst.data(), pkt_data, 6);
 
-            if (dst != local_mac_ && dst != BROADCAST_MAC) continue;
+            Mac key_multicast = detail::get_key_multicast_mac(cfg_.key);
+            if (dst != local_mac_ && dst != BROADCAST_MAC &&
+                dst != GOOSE_MULTICAST_MAC && dst != key_multicast)
+                continue;
 
             auto msg = reassembler_.add(sender, hdr, payload);
             if (msg.has_value()) {
                 if (msg->type == MsgType::Control && !msg->data.empty() &&
                     msg->data[0] == uint8_t(ControlCmd::DiscoveryRequest) &&
                     cfg_.auto_discovery_reply) {
+
+                    // Extract challenge cookie from request if present
+                    uint64_t req_cookie = 0;
+                    if (msg->data.size() >= 9) {
+                        for (int i = 0; i < 8; ++i)
+                            req_cookie = (req_cookie << 8) | msg->data[1 + i];
+                    }
+
+                    // Dynamic random padding for response (32 to 96 bytes)
+                    std::uniform_int_distribution<size_t> pad_dist(32, 96);
+                    size_t pad_len = pad_dist(rng_);
+
                     std::vector<uint8_t> resp;
+                    resp.reserve(1 + 8 + 2 + cfg_.node_name.size() + 2 + pad_len);
                     resp.push_back(uint8_t(ControlCmd::DiscoveryResponse));
+
+                    // Echo back the challenge cookie
+                    for (int i = 7; i >= 0; --i)
+                        resp.push_back(uint8_t((req_cookie >> (i * 8)) & 0xFF));
+
+                    // Node name
+                    uint16_t nlen = uint16_t(cfg_.node_name.size());
+                    resp.push_back(uint8_t(nlen >> 8));
+                    resp.push_back(uint8_t(nlen & 0xFF));
                     resp.insert(resp.end(), cfg_.node_name.begin(), cfg_.node_name.end());
+
+                    // Dynamic random padding
+                    resp.push_back(uint8_t(pad_len >> 8));
+                    resp.push_back(uint8_t(pad_len & 0xFF));
+                    for (size_t i = 0; i < pad_len; ++i) resp.push_back(uint8_t(rng_() & 0xFF));
+
                     send_to(msg->sender_mac, resp.data(), resp.size(), MsgType::Control);
                 }
                 return msg;

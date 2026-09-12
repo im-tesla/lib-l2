@@ -37,12 +37,14 @@ A cross-platform, lightweight, header-only C++20 library for covert, encrypted r
 
 - **Cross-Platform & Header-Only**: Drop [`libl2.h`](src/libl2.h) into any C++20 project. Dynamically loads the platform capture library at runtime—**Npcap** (`wpcap.dll`) on Windows, and built-in system **libpcap** (`libpcap.dylib`) on macOS. Zero build SDKs or static link dependencies required.
 - **Pure Layer 2 Networking**: Operates directly on raw Ethernet frames using industrial EtherType `0x88B7` (IEC 61850 GOOSE). Bypasses IP routing, ARP tables, OS firewalls, and port scanners.
-- **Automatic Peer Discovery**: No need to manually look up or type 6-byte hexadecimal MAC addresses. Senders emit encrypted discovery beacons (`ControlCmd::DiscoveryRequest`) and receivers auto-announce their friendly node names, seamlessly switching to direct stealth unicast for ongoing communication.
+- **Automatic Randomized Peer Discovery**: Zero static signatures during peer discovery. Discovery beacons use key-derived IEC 61850 GOOSE multicast destination addresses (`01:0C:CD:01:xx:xx`), 64-bit cryptographically random challenge cookies for anti-replay protection, and dynamic random padding (32–96 bytes) to eliminate fixed-packet-length fingerprinting. Once discovered, peers automatically transition to direct unicast.
 - **Strong Encryption**: End-to-end payload and metadata encryption using **ChaCha20** (256-bit pre-shared key, 96-bit cryptographically random per-frame nonce).
 - **Integrity Verification**: 32-bit FNV-1a header checksum validated post-decryption; rejects corrupted frames and wrong keys immediately.
-- **Traffic Analysis Resistance**:
-  - **Random Length Masking**: Configurable per-frame random padding (default up to 8 bytes) to obscure exact packet sizes and thwart length-based traffic fingerprinting.
-  - **Ephemeral MAC Spoofing**: Supports generating random locally-administered unicast MAC addresses per session to prevent hardware MAC fingerprinting.
+- **Anti-Fingerprinting & Signature Randomization**:
+  - **Key-Derived GOOSE APPID**: Replaces static cleartext magic tags with a 16-bit IEC 61850 Application ID deterministically derived from the PSK (`0x0001`–`0x3FFF`), blending naturally with industrial SCADA automation traffic.
+  - **Multicast Discovery**: Camouflaged as standard IEC 61850 multicast groups rather than conspicuous `FF:FF:FF:FF:FF:FF` broadcast frames.
+  - **Dynamic Variable Padding**: High-entropy per-frame and per-beacon random padding renders packet lengths variable across successive transmissions.
+  - **Ephemeral Session MAC Spoofing**: Generate random locally-administered unicast MAC addresses per session (`--random-mac`) to prevent hardware MAC fingerprinting.
 - **Transparent Fragmentation & Reassembly**: Automatically fragments payloads exceeding standard MTU (1500 bytes) and reassembles them in memory with automatic time-based purging of stale frames.
 - **In-Kernel BPF Filtering**: Utilizes BPF driver filtering (`ether[12:2] = 0x88b7`) to drop irrelevant traffic in kernel space before reaching user space, minimizing CPU overhead and latency.
 
@@ -71,8 +73,8 @@ Each transmitted frame is encapsulated in a standard Ethernet II frame camouflag
 +-------------------------------------------------------------------------------+
 |                             Cleartext Ethernet II                             |
 +-------------------+-------------------+-------------------+-------------------+
-|  Destination MAC  |    Source MAC     | EtherType: 0x88B7 |   Magic: 0x4C32   |
-|     (6 bytes)     |     (6 bytes)     |     (2 bytes)     |      ("L2")       |
+|  Destination MAC  |    Source MAC     | EtherType: 0x88B7 |  APPID (Key FNV)  |
+|  (Unicast/MCAST)  | (Hardware/Random) |     (2 bytes)     | (IEC 61850 GOOSE) |
 +-------------------+-------------------+-------------------+-------------------+
 |  ChaCha20 Nonce   |                                                           |
 |    (12 bytes)     |                                                           |
@@ -95,11 +97,11 @@ Each transmitted frame is encapsulated in a standard Ethernet II frame camouflag
 | Section | Size | Description |
 |---|---|---|
 | Ethernet Header | 14 bytes | Dst MAC (6B) + Src MAC (6B) + EtherType (2B) |
-| Magic Tag | 2 bytes | ASCII `"L2"` (`0x4C32`) |
+| IEC 61850 APPID | 2 bytes | Key-derived GOOSE Application Identifier (`0x0001`–`0x3FFF`) |
 | Nonce | 12 bytes | Cryptographically random per-frame ChaCha20 nonce |
-| **Cleartext Overhead** | **28 bytes** | Visible on the wire |
+| **Cleartext Overhead** | **28 bytes** | Camouflaged as standard IEC 61850 automation traffic |
 | Inner Header | 16 bytes | Msg ID (4B) + Frag Idx (2B) + Frag Total (2B) + Type (1B) + Flags (1B) + Payload Len (2B) + FNV-1a Checksum (4B) |
-| Payload | 0 – 1456 bytes | User payload data |
+| Payload | 0 – 1456 bytes | User payload data (Discovery includes challenge cookie + dynamic noise) |
 | Padding | 0 – 8 bytes | Random bytes for length masking |
 | **Max Ethernet Frame** | **1500 bytes** | Standard MTU limit (Payload ≤ 1456 bytes) |
 
@@ -262,10 +264,10 @@ clang++ -std=c++20 -O2 -Isrc src/example.cpp -o lib-l2
 output\lib-l2.exe
 
 # 2. Start receiver (auto-replies to discovery beacons):
-output\lib-l2.exe recv <adapter_index> [node_name]
+output\lib-l2.exe recv <adapter_index> [node_name] [--random-mac]
 
 # 3. Start sender (auto-discovers peer and switches to stealth unicast):
-output\lib-l2.exe send <adapter_index>
+output\lib-l2.exe send <adapter_index> [peer_mac] [--random-mac]
 ```
 
 ### On macOS (Run Terminal with sudo)
@@ -274,10 +276,10 @@ output\lib-l2.exe send <adapter_index>
 sudo ./lib-l2
 
 # 2. Start receiver:
-sudo ./lib-l2 recv <adapter_index> [node_name]
+sudo ./lib-l2 recv <adapter_index> [node_name] [--random-mac]
 
 # 3. Start sender (auto-discovers peer over LAN):
-sudo ./lib-l2 send <adapter_index>
+sudo ./lib-l2 send <adapter_index> [peer_mac] [--random-mac]
 ```
 
 ### Discovery Terminal Walkthrough

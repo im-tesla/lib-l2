@@ -23,11 +23,12 @@ static void print_usage(const char* exe) {
     std::cout << "lib-l2 example\n"
               << "========================\n\n"
               << "Usage:\n"
-              << "  " << exe << " send  <adapter> [peer_mac]   Interactive sender (auto-discovers if omitted)\n"
-              << "  " << exe << " recv  <adapter> [node_name]  Receiver / listener (auto-replies to discovery)\n\n"
-              << "  adapter   : Index number (0, 1, ...) or interface name (e.g. en0, en5, eth0)\n"
-              << "  peer_mac  : aa:bb:cc:dd:ee:ff (optional; auto-discovery used if omitted)\n"
-              << "  node_name : friendly name announced in discovery (optional)\n\n";
+              << "  " << exe << " send  <adapter> [peer_mac]  [--random-mac]  Interactive sender (auto-discovers if omitted)\n"
+              << "  " << exe << " recv  <adapter> [node_name] [--random-mac]  Receiver / listener (auto-replies to discovery)\n\n"
+              << "  adapter      : Index number (0, 1, ...) or interface name (e.g. en0, en5, eth0)\n"
+              << "  peer_mac     : aa:bb:cc:dd:ee:ff (optional; auto-discovery used if omitted)\n"
+              << "  node_name    : friendly name announced in discovery (optional)\n"
+              << "  --random-mac : generate randomized session MAC address\n\n";
 }
 
 static void list_all_adapters(const std::vector<l2::AdapterInfo>& adapters) {
@@ -89,11 +90,12 @@ static int resolve_adapter(const std::vector<l2::AdapterInfo>& adapters, const s
     return -1;
 }
 
-static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* peer) {
+static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* peer, bool random_mac) {
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
-    cfg.adapter  = adapters[idx].name;
-    cfg.padding  = true;
+    cfg.adapter    = adapters[idx].name;
+    cfg.padding    = true;
+    cfg.random_mac = random_mac;
     std::memcpy(cfg.key, PSK, l2::KEY_SIZE);
 
     if (peer && *peer) {
@@ -108,7 +110,8 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
     }
 
     std::cout << "[OK] Channel open on " << adapters[idx].description << "\n"
-              << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n"
+              << "     Local MAC : " << l2::mac_to_string(ch.local_mac())
+              << (random_mac ? " (RANDOMIZED)" : "") << "\n"
               << "     Node Name : " << ch.node_name() << "\n";
 
     if (!peer || !*peer) {
@@ -170,12 +173,13 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
     return 0;
 }
 
-static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* node_name) {
+static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* node_name, bool random_mac) {
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
-    cfg.adapter  = adapters[idx].name;
-    cfg.peer_mac = l2::BROADCAST_MAC;  // accept from any peer
-    cfg.padding  = true;
+    cfg.adapter              = adapters[idx].name;
+    cfg.peer_mac             = l2::BROADCAST_MAC;  // accept from any peer
+    cfg.padding              = true;
+    cfg.random_mac           = random_mac;
     cfg.auto_discovery_reply = true;
     if (node_name && *node_name) {
         cfg.node_name = node_name;
@@ -188,17 +192,16 @@ static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
     }
 
     std::cout << "[OK] Listening on " << adapters[idx].description << "\n"
-              << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n"
+              << "     Local MAC : " << l2::mac_to_string(ch.local_mac())
+              << (random_mac ? " (RANDOMIZED)" : "") << "\n"
               << "     Node Name : " << ch.node_name() << "\n"
-              << "     Discovery : Auto-reply enabled\n\n"
+              << "     Discovery : Auto-reply enabled (multicast + challenge tokens + variable padding)\n\n"
               << "Waiting for frames... (Ctrl+C to stop)\n\n";
 
     ch.recv_loop([](const l2::ReceivedMessage& msg) {
         if (msg.type == l2::MsgType::Control) {
             if (!msg.data.empty() && msg.data[0] == uint8_t(l2::ControlCmd::DiscoveryRequest)) {
-                std::string req_name = msg.data.size() > 1
-                    ? std::string(msg.data.begin() + 1, msg.data.end())
-                    : "unknown";
+                std::string req_name = l2::extract_node_name(msg.data);
                 std::cout << "[DISCOVERY from " << l2::mac_to_string(msg.sender_mac)
                           << " (\"" << req_name << "\")] Auto-replied with node announcement\n";
             }
@@ -256,13 +259,23 @@ int main(int argc, char* argv[]) {
         return wait_exit(1);
     }
 
+    bool random_mac = false;
+    const char* extra_arg = nullptr;
+
+    for (int i = 3; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--random-mac" || arg == "-r") {
+            random_mac = true;
+        } else if (!extra_arg) {
+            extra_arg = argv[i];
+        }
+    }
+
     if (mode == "send") {
-        const char* peer = (argc >= 4) ? argv[3] : nullptr;
-        return mode_send(adapters, adapter_idx, peer);
+        return mode_send(adapters, adapter_idx, extra_arg, random_mac);
     }
     if (mode == "recv") {
-        const char* name = (argc >= 4) ? argv[3] : nullptr;
-        return mode_recv(adapters, adapter_idx, name);
+        return mode_recv(adapters, adapter_idx, extra_arg, random_mac);
     }
 
     print_usage(argv[0]);
