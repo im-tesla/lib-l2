@@ -43,12 +43,25 @@ inline constexpr size_t   KEY_SIZE           = 32;       // ChaCha20 key size
 inline constexpr size_t   DEFAULT_MAX_PAD    = 8;        // max random padding bytes
 
 using Mac = std::array<uint8_t, 6>;
+inline constexpr Mac BROADCAST_MAC = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 enum class MsgType : uint8_t {
     Text    = 0x01,
     Jpeg    = 0x02,
     Binary  = 0x03,
     Control = 0xFF,
+};
+
+enum class ControlCmd : uint8_t {
+    DiscoveryRequest  = 0x01,
+    DiscoveryResponse = 0x02,
+    Ping              = 0x03,
+    Pong              = 0x04,
+};
+
+struct DiscoveredPeer {
+    Mac         mac{};
+    std::string name;
 };
 
 enum class MsgFlags : uint8_t {
@@ -526,6 +539,8 @@ public:
         bool        padding     = true;   // enable random per-frame padding
         size_t      max_pad     = DEFAULT_MAX_PAD;  // max padding bytes
         int         read_timeout_ms = 1;  // pcap read timeout (lower = less latency)
+        bool        auto_discovery_reply = true; // automatically reply to discovery requests
+        std::string node_name;        // friendly name announced in discovery
     };
 
     L2Channel() = default;
@@ -543,6 +558,16 @@ public:
         }
 
         cfg_ = cfg;
+
+        if (cfg_.node_name.empty()) {
+            char comp_name[MAX_COMPUTERNAME_LENGTH + 1]{};
+            DWORD comp_size = sizeof(comp_name);
+            if (GetComputerNameA(comp_name, &comp_size)) {
+                cfg_.node_name = comp_name;
+            } else {
+                cfg_.node_name = "node";
+            }
+        }
 
         if (cfg_.random_mac) {
             std::random_device rd;
@@ -610,8 +635,12 @@ public:
     bool is_open() const { return open_; }
     const Mac& local_mac() const { return local_mac_; }
     const std::string& last_error() const { return last_error_; }
+    const std::string& node_name() const { return cfg_.node_name; }
+    void set_node_name(const std::string& name) { cfg_.node_name = name; }
+    const Mac& peer_mac() const { return cfg_.peer_mac; }
+    void set_peer_mac(const Mac& mac) { cfg_.peer_mac = mac; }
 
-    bool send(const void* data, size_t len, MsgType type) {
+    bool send_to(const Mac& dst, const void* data, size_t len, MsgType type) {
         if (!open_) { last_error_ = "Channel not open"; return false; }
 
         const uint8_t* bytes = static_cast<const uint8_t*>(data);
@@ -638,7 +667,7 @@ public:
             hdr.payload_len = uint16_t(chunk);
 
             size_t frame_len = frame::build(
-                cfg_.peer_mac, local_mac_, cfg_.key,
+                dst, local_mac_, cfg_.key,
                 hdr, bytes + offset, frame_buf, rng_,
                 cfg_.padding ? cfg_.max_pad : 0
             );
@@ -652,8 +681,16 @@ public:
         return true;
     }
 
+    bool send(const void* data, size_t len, MsgType type) {
+        return send_to(cfg_.peer_mac, data, len, type);
+    }
+
+    bool send_to(const Mac& dst, const std::string& text) {
+        return send_to(dst, text.data(), text.size(), MsgType::Text);
+    }
+
     bool send(const std::string& text) {
-        return send(text.data(), text.size(), MsgType::Text);
+        return send_to(cfg_.peer_mac, text);
     }
 
     bool send_jpeg(const void* data, size_t len) {
@@ -662,6 +699,51 @@ public:
 
     bool send_binary(const void* data, size_t len) {
         return send(data, len, MsgType::Binary);
+    }
+
+    std::vector<DiscoveredPeer> discover_peers(int timeout_ms = 1500, const std::string& request_name = "") {
+        std::vector<DiscoveredPeer> peers;
+        if (!open_) { last_error_ = "Channel not open"; return peers; }
+
+        std::string req_name = request_name.empty() ? cfg_.node_name : request_name;
+        std::vector<uint8_t> req;
+        req.push_back(uint8_t(ControlCmd::DiscoveryRequest));
+        req.insert(req.end(), req_name.begin(), req_name.end());
+
+        if (!send_to(BROADCAST_MAC, req.data(), req.size(), MsgType::Control))
+            return peers;
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
+
+            int step_timeout = int(std::min<int64_t>(remaining, 50));
+            auto msg = recv(step_timeout);
+            if (msg.has_value() && msg->type == MsgType::Control && !msg->data.empty()) {
+                if (msg->data[0] == uint8_t(ControlCmd::DiscoveryResponse)) {
+                    auto it = std::find_if(peers.begin(), peers.end(),
+                        [&](const DiscoveredPeer& p) { return p.mac == msg->sender_mac; });
+                    if (it == peers.end()) {
+                        DiscoveredPeer p;
+                        p.mac = msg->sender_mac;
+                        if (msg->data.size() > 1) {
+                            p.name.assign(msg->data.begin() + 1, msg->data.end());
+                        }
+                        peers.push_back(std::move(p));
+                    }
+                }
+            }
+        }
+
+        return peers;
+    }
+
+    std::optional<Mac> discover_peer(int timeout_ms = 1500) {
+        auto peers = discover_peers(timeout_ms);
+        if (peers.empty()) return std::nullopt;
+        return peers[0].mac;
     }
 
     std::optional<ReceivedMessage> recv(int timeout_ms = 1000) {
@@ -687,14 +769,25 @@ public:
                               sender, hdr, payload))
                 continue;
 
+            if (sender == local_mac_) continue;
+
             Mac dst;
             std::memcpy(dst.data(), pkt_data, 6);
-            static constexpr Mac BROADCAST = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-            if (dst != local_mac_ && dst != BROADCAST) continue;
+            if (dst != local_mac_ && dst != BROADCAST_MAC) continue;
 
             auto msg = reassembler_.add(sender, hdr, payload);
-            if (msg.has_value()) return msg;
+            if (msg.has_value()) {
+                if (msg->type == MsgType::Control && !msg->data.empty() &&
+                    msg->data[0] == uint8_t(ControlCmd::DiscoveryRequest) &&
+                    cfg_.auto_discovery_reply) {
+                    std::vector<uint8_t> resp;
+                    resp.push_back(uint8_t(ControlCmd::DiscoveryResponse));
+                    resp.insert(resp.end(), cfg_.node_name.begin(), cfg_.node_name.end());
+                    send_to(msg->sender_mac, resp.data(), resp.size(), MsgType::Control);
+                }
+                return msg;
+            }
 
             if (++purge_counter_ % 1000 == 0)
                 reassembler_.purge();

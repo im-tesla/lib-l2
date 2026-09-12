@@ -10,6 +10,7 @@ A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Da
 
 - **Header-Only & Zero Build Dependencies**: Just drop [`libl2.h`](src/libl2.h) into your project. Dynamically loads Npcap (`wpcap.dll`) at runtime—no need to install the Npcap SDK, configure header search paths, or link `wpcap.lib`.
 - **Pure Layer 2 Networking**: Operates directly on raw Ethernet frames (EtherType `0x88B7`, IEC 61850 GOOSE). Bypasses IP routing, ARP tables, OS firewalls, and port scanners.
+- **Automatic Peer Discovery**: No need to manually look up or type destination MAC addresses. Nodes broadcast encrypted discovery beacons (`ControlCmd::DiscoveryRequest`) and automatically reply with their friendly node names, seamlessly switching to stealth unicast for ongoing communication.
 - **Strong Encryption**: End-to-end payload and metadata encryption using **ChaCha20** (256-bit pre-shared key, 96-bit random per-frame nonce).
 - **Integrity Verification**: 32-bit FNV-1a header checksum validated post-decryption; rejects invalid packets and wrong keys immediately.
 - **Traffic Analysis Resistance**:
@@ -189,11 +190,16 @@ msbuild src\lib-l2.vcxproj /p:Configuration=Release /p:Platform=x64
 
 2. **Start Receiver** (on Machine A or Interface A):
    ```cmd
-   output\lib-l2.exe recv <adapter_index>
+   output\lib-l2.exe recv <adapter_index> [node_name]
    ```
+   *The receiver automatically replies to encrypted discovery beacons from senders.*
 
 3. **Start Sender** (on Machine B or Interface B):
    ```cmd
+   # Auto-discovers receiver and connects via stealth unicast automatically:
+   output\lib-l2.exe send <adapter_index>
+
+   # Or specify target MAC directly:
    output\lib-l2.exe send <adapter_index> <receiver_mac>
    ```
 
@@ -203,9 +209,28 @@ msbuild src\lib-l2.vcxproj /p:Configuration=Release /p:Platform=x64
 
 ### Structs & Types
 
-#### `l2::Mac`
+#### `l2::Mac` & `l2::BROADCAST_MAC`
 ```cpp
 using Mac = std::array<uint8_t, 6>;
+inline constexpr Mac BROADCAST_MAC = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+```
+
+#### `l2::ControlCmd`
+```cpp
+enum class ControlCmd : uint8_t {
+    DiscoveryRequest  = 0x01,
+    DiscoveryResponse = 0x02,
+    Ping              = 0x03,
+    Pong              = 0x04,
+};
+```
+
+#### `l2::DiscoveredPeer`
+```cpp
+struct DiscoveredPeer {
+    Mac         mac{};  // Discovered hardware or session MAC
+    std::string name;   // Friendly node name (e.g. computer hostname)
+};
 ```
 
 #### `l2::MsgType`
@@ -239,14 +264,16 @@ struct AdapterInfo {
 #### `l2::L2Channel::Config`
 ```cpp
 struct Config {
-    std::string adapter;          // Npcap device name (from list_adapters)
-    Mac         peer_mac{};       // Destination MAC address
-    uint8_t     key[KEY_SIZE]{};  // Pre-shared 256-bit encryption key
-    Mac         local_mac{};      // Custom local MAC override (empty = auto-detect)
-    bool        random_mac = false; // Generate random session MAC per run
-    bool        padding    = true;  // Add random padding to mask payload length
-    size_t      max_pad    = 8;     // Max padding bytes to append
-    int         read_timeout_ms = 1;// pcap read timeout in ms (default: 1)
+    std::string adapter;                 // Npcap device name (from list_adapters)
+    Mac         peer_mac{};              // Destination MAC address
+    uint8_t     key[KEY_SIZE]{};         // Pre-shared 256-bit encryption key
+    Mac         local_mac{};             // Custom local MAC override (empty = auto-detect)
+    bool        random_mac = false;      // Generate random session MAC per run
+    bool        padding    = true;       // Add random padding to mask payload length
+    size_t      max_pad    = 8;          // Max padding bytes to append
+    int         read_timeout_ms = 1;     // pcap read timeout in ms (default: 1)
+    bool        auto_discovery_reply = true; // Auto-reply to discovery beacons
+    std::string node_name;               // Friendly name (defaults to Windows COMPUTERNAME)
 };
 ```
 
@@ -262,12 +289,19 @@ struct Config {
 
 | Method | Description |
 |---|---|
-| `bool open(const Config& cfg)` | Opens the adapter in raw promiscuous mode, compiles the BPF filter, and sets up encryption. |
+| `bool open(const Config& cfg)` | Opens adapter in raw promiscuous mode, compiles BPF filter, and initializes encryption. |
 | `void close()` | Closes the adapter and frees internal pcap resources. |
 | `bool is_open() const` | Returns `true` if the channel is currently open. |
-| `const Mac& local_mac() const` | Returns the local MAC address currently in use (hardware, overridden, or randomized). |
+| `const Mac& local_mac() const` | Returns the local MAC address currently in use. |
+| `const Mac& peer_mac() const` | Returns currently configured destination peer MAC. |
+| `void set_peer_mac(const Mac& mac)` | Dynamically updates destination peer MAC. |
+| `const std::string& node_name() const` | Returns friendly node name. |
+| `void set_node_name(const std::string& name)` | Sets friendly node name announced in discovery responses. |
 | `const std::string& last_error() const`| Returns the last recorded error message. |
-| `bool send(const void* data, size_t len, MsgType type)` | Fragments, encrypts, and transmits arbitrary data. |
+| `std::vector<DiscoveredPeer> discover_peers(timeout_ms = 1500)` | Broadcasts an encrypted discovery beacon and returns all responding peers. |
+| `std::optional<Mac> discover_peer(timeout_ms = 1500)` | Convenience method returning the MAC of the first discovered peer. |
+| `bool send(const void* data, size_t len, MsgType type)` | Fragments, encrypts, and transmits data to `peer_mac()`. |
+| `bool send_to(const Mac& dst, const void* data, size_t len, MsgType type)` | Transmits data directly to a specific target MAC. |
 | `bool send(const std::string& text)` | Helper to transmit a `MsgType::Text` string. |
 | `bool send_jpeg(const void* data, size_t len)` | Helper to transmit a `MsgType::Jpeg` image buffer. |
 | `bool send_binary(const void* data, size_t len)` | Helper to transmit a `MsgType::Binary` raw buffer. |

@@ -1,14 +1,3 @@
-// ============================================================================
-// lib-l2 Example: Stealth L2 Communication Demo
-//
-// Usage:
-//   lib-l2.exe send <adapter_index> <peer_mac>    Send interactive text messages
-//   lib-l2.exe recv <adapter_index>               Receive and display messages
-//
-// Both sides must use the same pre-shared key.
-// Run as Administrator (Npcap requires elevation for raw capture).
-// ============================================================================
-
 #include "libl2.h"
 #include <iostream>
 #include <string>
@@ -32,9 +21,10 @@ static void print_usage(const char* exe) {
     std::cout << "lib-l2 example\n"
               << "========================\n\n"
               << "Usage:\n"
-              << "  " << exe << " send  <adapter_index> <peer_mac>   Interactive sender\n"
-              << "  " << exe << " recv  <adapter_index>              Receiver / listener\n\n"
-              << "  peer_mac format: aa:bb:cc:dd:ee:ff\n\n";
+              << "  " << exe << " send  <adapter_index> [peer_mac]   Interactive sender (auto-discovers if omitted)\n"
+              << "  " << exe << " recv  <adapter_index> [node_name]  Receiver / listener (auto-replies to discovery)\n\n"
+              << "  peer_mac  : aa:bb:cc:dd:ee:ff (optional; auto-discovery used if omitted)\n"
+              << "  node_name : friendly name announced in discovery (optional)\n\n";
 }
 
 static void list_all_adapters(const std::vector<l2::AdapterInfo>& adapters) {
@@ -50,9 +40,14 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
     cfg.adapter  = adapters[idx].name;
-    cfg.peer_mac = l2::parse_mac(peer);
     cfg.padding  = true;
     std::memcpy(cfg.key, PSK, l2::KEY_SIZE);
+
+    if (peer && *peer) {
+        cfg.peer_mac = l2::parse_mac(peer);
+    } else {
+        cfg.peer_mac = l2::BROADCAST_MAC;
+    }
 
     if (!ch.open(cfg)) {
         std::cerr << "[ERROR] " << ch.last_error() << "\n";
@@ -61,7 +56,46 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
 
     std::cout << "[OK] Channel open on " << adapters[idx].description << "\n"
               << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n"
-              << "     Peer  MAC : " << l2::mac_to_string(cfg.peer_mac) << "\n"
+              << "     Node Name : " << ch.node_name() << "\n";
+
+    if (!peer || !*peer) {
+        std::cout << "\n[*] No destination MAC specified. Discovering peers on network...\n";
+        auto peers = ch.discover_peers(2000);
+        if (peers.empty()) {
+            std::cout << "[!] No peers responded to discovery beacon.\n"
+                      << "    Fallback to broadcast (FF:FF:FF:FF:FF:FF)? [Y/n]: ";
+            std::string ans;
+            std::getline(std::cin, ans);
+            if (!ans.empty() && ans != "y" && ans != "Y") {
+                return wait_exit(1);
+            }
+            ch.set_peer_mac(l2::BROADCAST_MAC);
+            std::cout << "    Using broadcast mode.\n\n";
+        } else if (peers.size() == 1) {
+            ch.set_peer_mac(peers[0].mac);
+            std::cout << "[+] Found 1 peer: " << l2::mac_to_string(peers[0].mac);
+            if (!peers[0].name.empty()) std::cout << " (\"" << peers[0].name << "\")";
+            std::cout << "\n    Connected! Switched to direct stealth unicast.\n\n";
+        } else {
+            std::cout << "[+] Found " << peers.size() << " peers:\n";
+            for (size_t i = 0; i < peers.size(); ++i) {
+                std::cout << "    [" << i << "] " << l2::mac_to_string(peers[i].mac);
+                if (!peers[i].name.empty()) std::cout << " (\"" << peers[i].name << "\")";
+                std::cout << "\n";
+            }
+            std::cout << "Select peer index [0-" << peers.size() - 1 << "]: ";
+            std::string choice;
+            std::getline(std::cin, choice);
+            int selected = 0;
+            if (!choice.empty()) selected = std::atoi(choice.c_str());
+            if (selected < 0 || selected >= int(peers.size())) selected = 0;
+            ch.set_peer_mac(peers[selected].mac);
+            std::cout << "    Selected " << l2::mac_to_string(peers[selected].mac)
+                      << ". Switched to direct stealth unicast.\n\n";
+        }
+    }
+
+    std::cout << "     Peer MAC  : " << l2::mac_to_string(ch.peer_mac()) << "\n"
               << "     Padding   : " << (cfg.padding ? "ON" : "OFF") << "\n\n"
               << "Type messages to send (empty line to quit):\n\n";
 
@@ -83,12 +117,16 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
     return 0;
 }
 
-static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx) {
+static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* node_name) {
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
     cfg.adapter  = adapters[idx].name;
-    cfg.peer_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // accept from any peer
+    cfg.peer_mac = l2::BROADCAST_MAC;  // accept from any peer
     cfg.padding  = true;
+    cfg.auto_discovery_reply = true;
+    if (node_name && *node_name) {
+        cfg.node_name = node_name;
+    }
     std::memcpy(cfg.key, PSK, l2::KEY_SIZE);
 
     if (!ch.open(cfg)) {
@@ -97,10 +135,23 @@ static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx) {
     }
 
     std::cout << "[OK] Listening on " << adapters[idx].description << "\n"
-              << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n\n"
+              << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n"
+              << "     Node Name : " << ch.node_name() << "\n"
+              << "     Discovery : Auto-reply enabled\n\n"
               << "Waiting for stealth frames... (Ctrl+C to stop)\n\n";
 
     ch.recv_loop([](const l2::ReceivedMessage& msg) {
+        if (msg.type == l2::MsgType::Control) {
+            if (!msg.data.empty() && msg.data[0] == uint8_t(l2::ControlCmd::DiscoveryRequest)) {
+                std::string req_name = msg.data.size() > 1
+                    ? std::string(msg.data.begin() + 1, msg.data.end())
+                    : "unknown";
+                std::cout << "[DISCOVERY from " << l2::mac_to_string(msg.sender_mac)
+                          << " (\"" << req_name << "\")] Auto-replied with node announcement\n";
+            }
+            return true;
+        }
+
         const char* type_str = "???";
         switch (msg.type) {
             case l2::MsgType::Text:    type_str = "TEXT"; break;
@@ -147,11 +198,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "send") {
-        if (argc < 4) { std::cerr << "send mode requires <peer_mac>\n"; return wait_exit(1); }
-        return mode_send(adapters, adapter_idx, argv[3]);
+        const char* peer = (argc >= 4) ? argv[3] : nullptr;
+        return mode_send(adapters, adapter_idx, peer);
     }
     if (mode == "recv") {
-        return mode_recv(adapters, adapter_idx);
+        const char* name = (argc >= 4) ? argv[3] : nullptr;
+        return mode_recv(adapters, adapter_idx, name);
     }
 
     print_usage(argv[0]);
