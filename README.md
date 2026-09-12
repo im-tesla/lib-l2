@@ -135,7 +135,7 @@ Copy [`src/libl2.h`](src/libl2.h) into your project:
 
 ### 2. Sending with Automatic Peer Discovery
 
-No destination MAC needed—the sender broadcasts an encrypted discovery ping, auto-detects the receiver, and immediately switches to direct stealth unicast:
+No destination MAC needed—the sender emits an encrypted, randomized discovery beacon via key-derived IEC 61850 GOOSE multicast, auto-detects responding peers, and immediately switches to direct stealth unicast:
 
 ```cpp
 #include "libl2.h"
@@ -264,22 +264,24 @@ clang++ -std=c++20 -O2 -Isrc src/example.cpp -o lib-l2
 output\lib-l2.exe
 
 # 2. Start receiver (auto-replies to discovery beacons):
-output\lib-l2.exe recv <adapter_index> [node_name] [--random-mac]
+# <adapter> can be an index number (e.g. 0) or interface name
+output\lib-l2.exe recv <adapter> [node_name] [--random-mac]
 
 # 3. Start sender (auto-discovers peer and switches to stealth unicast):
-output\lib-l2.exe send <adapter_index> [peer_mac] [--random-mac]
+output\lib-l2.exe send <adapter> [peer_mac] [--random-mac]
 ```
 
 ### On macOS (Run Terminal with sudo)
 ```bash
-# 1. List available network interfaces (e.g. en0):
+# 1. List available network interfaces (e.g. en0, en5):
 sudo ./lib-l2
 
 # 2. Start receiver:
-sudo ./lib-l2 recv <adapter_index> [node_name] [--random-mac]
+# <adapter> can be an index number (e.g. 0) or interface name (e.g. en5)
+sudo ./lib-l2 recv <adapter> [node_name] [--random-mac]
 
 # 3. Start sender (auto-discovers peer over LAN):
-sudo ./lib-l2 send <adapter_index> [peer_mac] [--random-mac]
+sudo ./lib-l2 send <adapter> [peer_mac] [--random-mac]
 ```
 
 ### Discovery Terminal Walkthrough
@@ -307,10 +309,11 @@ Hello from Windows!
 
 ### Structs & Types
 
-#### `l2::Mac` & `l2::BROADCAST_MAC`
+#### `l2::Mac`, `l2::BROADCAST_MAC`, & `l2::GOOSE_MULTICAST_MAC`
 ```cpp
 using Mac = std::array<uint8_t, 6>;
-inline constexpr Mac BROADCAST_MAC = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+inline constexpr Mac BROADCAST_MAC       = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+inline constexpr Mac GOOSE_MULTICAST_MAC = {0x01, 0x0C, 0xCD, 0x01, 0x00, 0x01};
 ```
 
 #### `l2::ControlCmd`
@@ -382,6 +385,7 @@ struct Config {
 | `l2::list_adapters()` | Enumerates all network adapters with valid MAC addresses. Returns `std::vector<AdapterInfo>`. |
 | `l2::parse_mac(const std::string& str)` | Parses a MAC string in `"aa:bb:cc:dd:ee:ff"` format into `l2::Mac`. |
 | `l2::mac_to_string(const l2::Mac& m)` | Formats `l2::Mac` into standard colon-separated hex string representation. |
+| `l2::extract_node_name(data)` | Parses friendly node name from discovery control frames (supports tokens and dynamic padding). |
 
 ### `l2::L2Channel`
 
@@ -396,7 +400,7 @@ struct Config {
 | `const std::string& node_name() const` | Returns friendly node name. |
 | `void set_node_name(const std::string& name)` | Sets friendly node name announced in discovery responses. |
 | `const std::string& last_error() const`| Returns the last recorded error message. |
-| `std::vector<DiscoveredPeer> discover_peers(timeout_ms = 1500)` | Broadcasts an encrypted discovery beacon and returns all responding peers. |
+| `std::vector<DiscoveredPeer> discover_peers(timeout_ms = 1500)` | Emits randomized discovery beacons (key-derived GOOSE multicast, 64-bit anti-replay token, variable padding) and returns responding peers. |
 | `std::optional<Mac> discover_peer(timeout_ms = 1500)` | Convenience method returning the MAC of the first discovered peer. |
 | `bool send(const void* data, size_t len, MsgType type)` | Fragments, encrypts, and transmits data to `peer_mac()`. |
 | `bool send_to(const Mac& dst, const void* data, size_t len, MsgType type)` | Transmits data directly to a specific target MAC. |
