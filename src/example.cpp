@@ -77,7 +77,7 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
             ch.set_peer_mac(peers[0].mac);
             std::cout << "[+] Found 1 peer: " << l2::mac_to_string(peers[0].mac);
             if (!peers[0].name.empty()) std::cout << " (\"" << peers[0].name << "\")";
-            std::cout << "\n    Connected! Switched to direct stealth unicast.\n\n";
+            std::cout << "\n    Connected! Switched to direct unicast.\n\n";
         } else {
             std::cout << "[+] Found " << peers.size() << " peers:\n";
             for (size_t i = 0; i < peers.size(); ++i) {
@@ -93,7 +93,7 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
             if (selected < 0 || selected >= int(peers.size())) selected = 0;
             ch.set_peer_mac(peers[selected].mac);
             std::cout << "    Selected " << l2::mac_to_string(peers[selected].mac)
-                      << ". Switched to direct stealth unicast.\n\n";
+                      << ". Switched to direct unicast.\n\n";
         }
     }
 
@@ -140,7 +140,7 @@ static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
               << "     Local MAC : " << l2::mac_to_string(ch.local_mac()) << "\n"
               << "     Node Name : " << ch.node_name() << "\n"
               << "     Discovery : Auto-reply enabled\n\n"
-              << "Waiting for stealth frames... (Ctrl+C to stop)\n\n";
+              << "Waiting for frames... (Ctrl+C to stop)\n\n";
 
     ch.recv_loop([](const l2::ReceivedMessage& msg) {
         if (msg.type == l2::MsgType::Control) {
