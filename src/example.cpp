@@ -23,8 +23,9 @@ static void print_usage(const char* exe) {
     std::cout << "lib-l2 example\n"
               << "========================\n\n"
               << "Usage:\n"
-              << "  " << exe << " send  <adapter_index> [peer_mac]   Interactive sender (auto-discovers if omitted)\n"
-              << "  " << exe << " recv  <adapter_index> [node_name]  Receiver / listener (auto-replies to discovery)\n\n"
+              << "  " << exe << " send  <adapter> [peer_mac]   Interactive sender (auto-discovers if omitted)\n"
+              << "  " << exe << " recv  <adapter> [node_name]  Receiver / listener (auto-replies to discovery)\n\n"
+              << "  adapter   : Index number (0, 1, ...) or interface name (e.g. en0, en5, eth0)\n"
               << "  peer_mac  : aa:bb:cc:dd:ee:ff (optional; auto-discovery used if omitted)\n"
               << "  node_name : friendly name announced in discovery (optional)\n\n";
 }
@@ -32,10 +33,60 @@ static void print_usage(const char* exe) {
 static void list_all_adapters(const std::vector<l2::AdapterInfo>& adapters) {
     std::cout << "Network adapters:\n";
     for (size_t i = 0; i < adapters.size(); ++i) {
-        std::cout << "  [" << i << "] " << adapters[i].description
-                  << "  MAC: " << l2::mac_to_string(adapters[i].mac) << "\n";
+        std::cout << "  [" << i << "] ";
+        if (!adapters[i].description.empty() && adapters[i].description != "(no description)") {
+            std::cout << adapters[i].description;
+            if (adapters[i].name.find("\\Device\\") == std::string::npos &&
+                adapters[i].name != adapters[i].description) {
+                std::cout << " [" << adapters[i].name << "]";
+            }
+        } else {
+            std::cout << adapters[i].name;
+        }
+        std::cout << "  MAC: " << l2::mac_to_string(adapters[i].mac) << "\n";
     }
     std::cout << "\n";
+}
+
+static int resolve_adapter(const std::vector<l2::AdapterInfo>& adapters, const std::string& input) {
+    if (input.empty()) return -1;
+
+    // 1. Check if input is a pure numeric index (e.g. "0", "1", "2")
+    bool all_digits = std::all_of(input.begin(), input.end(), ::isdigit);
+    if (all_digits) {
+        int idx = std::atoi(input.c_str());
+        if (idx >= 0 && idx < int(adapters.size())) return idx;
+    }
+
+    // 2. Exact match on adapter name (e.g. "en0", "en5", "eth0")
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        if (adapters[i].name == input) return int(i);
+    }
+
+    // 3. Case-insensitive match on adapter name
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        if (adapters[i].name.size() == input.size()) {
+            bool match = true;
+            for (size_t j = 0; j < input.size(); ++j) {
+                if (std::tolower(static_cast<unsigned char>(adapters[i].name[j])) !=
+                    std::tolower(static_cast<unsigned char>(input[j]))) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return int(i);
+        }
+    }
+
+    // 4. Substring match on description or name
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        if (adapters[i].description.find(input) != std::string::npos ||
+            adapters[i].name.find(input) != std::string::npos) {
+            return int(i);
+        }
+    }
+
+    return -1;
 }
 
 static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* peer) {
@@ -197,10 +248,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
-    int adapter_idx  = std::atoi(argv[2]);
+    int adapter_idx  = resolve_adapter(adapters, argv[2]);
 
-    if (adapter_idx < 0 || adapter_idx >= int(adapters.size())) {
-        std::cerr << "Invalid adapter index (valid: 0-" << adapters.size() - 1 << ")\n";
+    if (adapter_idx < 0) {
+        std::cerr << "Invalid adapter '" << argv[2] << "'. Valid options are 0-"
+                  << adapters.size() - 1 << " or an interface name (e.g. en0, en5).\n";
         return wait_exit(1);
     }
 
