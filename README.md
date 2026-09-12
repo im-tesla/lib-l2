@@ -1,29 +1,71 @@
 # lib-l2
 
-A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Data Link)** communication on Windows and macOS (with Linux support).
+<p align="center">
+  <a href="#readme"><img src="https://img.shields.io/badge/C%2B%2B-20-00599C.svg?style=for-the-badge&logo=c%2B%2B" alt="C++20" /></a>
+  <a href="#readme"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg?style=for-the-badge" alt="Platforms" /></a>
+  <a href="#readme"><img src="https://img.shields.io/badge/Design-Header--Only-success.svg?style=for-the-badge" alt="Header-Only" /></a>
+  <a href="#readme"><img src="https://img.shields.io/badge/Cipher-ChaCha20-orange.svg?style=for-the-badge" alt="ChaCha20" /></a>
+  <a href="#readme"><img src="https://img.shields.io/badge/Protocol-IEC%2061850%20GOOSE-blueviolet.svg?style=for-the-badge" alt="Protocol" /></a>
+</p>
 
-`lib-l2` transmits data directly over raw Ethernet frames, completely bypassing the Layer 3 (IP) and Layer 4 (TCP/UDP) network stacks. Because it does not use IP addresses, port numbers, or standard transport handshakes, it operates beneath standard OS socket layers and packet filtering rules.
+A cross-platform, lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Data Link)** communication across **Windows**, **macOS**, and **Linux**.
+
+`lib-l2` transmits data directly inside raw Ethernet frames, completely bypassing Layer 3 (IP) and Layer 4 (TCP/UDP) network stacks. Because it uses no IP addresses, port numbers, or standard transport handshakes, it operates beneath standard OS socket layers, packet inspection filters, and firewall port rules.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Cross-Platform Architecture](#cross-platform-architecture)
+- [Frame Architecture](#frame-architecture)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+  - [1. Include Header](#1-include-the-header)
+  - [2. Auto-Discovery Sender](#2-sending-with-automatic-peer-discovery)
+  - [3. Listening Receiver](#3-receiving--listening)
+- [Building the Example CLI](#building-the-example-cli)
+  - [Windows](#building-on-windows)
+  - [macOS / Linux](#building-on-macos--linux)
+- [Running the Interactive Demo](#running-the-demo)
+- [API Reference](#api-reference)
+- [Security & Disclaimer](#security--disclaimer)
 
 ---
 
 ## Features
 
-- **Cross-Platform & Header-Only**: Just include [`libl2.h`](src/libl2.h). Dynamically loads the platform packet capture library at runtime—**Npcap** (`wpcap.dll`) on Windows, and built-in **libpcap** (`libpcap.dylib`) on macOS. Zero build SDKs or static link dependencies required.
-- **Pure Layer 2 Networking**: Operates directly on raw Ethernet frames (EtherType `0x88B7`, IEC 61850 GOOSE). Bypasses IP routing, ARP tables, OS firewalls, and port scanners.
-- **Automatic Peer Discovery**: No need to manually look up or type destination MAC addresses. Nodes broadcast encrypted discovery beacons (`ControlCmd::DiscoveryRequest`) and automatically reply with their friendly node names, seamlessly switching to stealth unicast for ongoing communication.
-- **Strong Encryption**: End-to-end payload and metadata encryption using **ChaCha20** (256-bit pre-shared key, 96-bit random per-frame nonce).
-- **Integrity Verification**: 32-bit FNV-1a header checksum validated post-decryption; rejects invalid packets and wrong keys immediately.
+- **Cross-Platform & Header-Only**: Drop [`libl2.h`](src/libl2.h) into any C++20 project. Dynamically loads the platform capture library at runtime—**Npcap** (`wpcap.dll`) on Windows, and built-in system **libpcap** (`libpcap.dylib`) on macOS. Zero build SDKs or static link dependencies required.
+- **Pure Layer 2 Networking**: Operates directly on raw Ethernet frames using industrial EtherType `0x88B7` (IEC 61850 GOOSE). Bypasses IP routing, ARP tables, OS firewalls, and port scanners.
+- **Automatic Peer Discovery**: No need to manually look up or type 6-byte hexadecimal MAC addresses. Senders emit encrypted discovery beacons (`ControlCmd::DiscoveryRequest`) and receivers auto-announce their friendly node names, seamlessly switching to direct stealth unicast for ongoing communication.
+- **Strong Encryption**: End-to-end payload and metadata encryption using **ChaCha20** (256-bit pre-shared key, 96-bit cryptographically random per-frame nonce).
+- **Integrity Verification**: 32-bit FNV-1a header checksum validated post-decryption; rejects corrupted frames and wrong keys immediately.
 - **Traffic Analysis Resistance**:
-  - **Random Padding**: Configurable per-frame random padding (default up to 8 bytes) to obscure exact packet sizes and prevent size-based fingerprinting.
-  - **Ephemeral MAC Spoofing**: Supports generating random locally-administered unicast MAC addresses per session or specifying custom static MACs.
-- **Automatic Fragmentation & Reassembly**: Transparently splits messages exceeding the standard Ethernet MTU (1500 bytes) into multiple fragments and reassembles them in memory with automatic stale-packet purging.
-- **Low-Latency & Kernel BPF Filtering**: Utilizes BPF kernel filtering (`ether[12:2] = 0x88b7`) to discard non-matching traffic in the driver before reaching user space, with minimal buffer delays.
+  - **Random Length Masking**: Configurable per-frame random padding (default up to 8 bytes) to obscure exact packet sizes and thwart length-based traffic fingerprinting.
+  - **Ephemeral MAC Spoofing**: Supports generating random locally-administered unicast MAC addresses per session to prevent hardware MAC fingerprinting.
+- **Transparent Fragmentation & Reassembly**: Automatically fragments payloads exceeding standard MTU (1500 bytes) and reassembles them in memory with automatic time-based purging of stale frames.
+- **In-Kernel BPF Filtering**: Utilizes BPF driver filtering (`ether[12:2] = 0x88b7`) to drop irrelevant traffic in kernel space before reaching user space, minimizing CPU overhead and latency.
+
+---
+
+## Cross-Platform Architecture
+
+`lib-l2` automatically adapts to your operating system at compile-time and runtime:
+
+| Feature | Windows | macOS | Linux |
+|---|---|---|---|
+| **Driver / Backend** | Npcap / WinPcap driver | Native BSD BPF (`/dev/bpf*`) | Raw Packet Sockets (`AF_PACKET`) |
+| **Runtime Library** | `wpcap.dll` (dynamic `LoadLibrary`) | `libpcap.dylib` (dynamic `dlopen`) | `libpcap.so` (dynamic `dlopen`) |
+| **MAC Address Lookup** | Windows IP Helper API (`GetAdaptersAddresses`) | BSD `getifaddrs` + `sockaddr_dl` (`AF_LINK`) | `SIOCGIFHWADDR` ioctl |
+| **Node Name Resolution** | `GetComputerNameA` | `gethostname` | `gethostname` |
+| **Build Tools** | Visual Studio 2022 / MSBuild | Apple Clang / Make / CMake | GCC / Clang / Make / CMake |
+| **Required Permissions** | Administrator | `sudo` / root | `sudo` / `CAP_NET_RAW` |
 
 ---
 
 ## Frame Architecture
 
-Each transmitted frame is encapsulated in a standard Ethernet II frame using the industrial EtherType `0x88B7` (IEC 61850 GOOSE):
+Each transmitted frame is encapsulated in a standard Ethernet II frame camouflaged under the IEC 61850 GOOSE EtherType `0x88B7`:
 
 ```
 +-------------------------------------------------------------------------------+
@@ -66,16 +108,16 @@ Each transmitted frame is encapsulated in a standard Ethernet II frame using the
 ## Requirements
 
 ### Windows
-- Windows 10 / 11 (x64)
-- Visual Studio 2022 with C++20 (`/std:c++20`)
-- [Npcap](https://npcap.com/) (installed in WinPcap-compatible mode)
-- Administrator privileges (for raw packet capture)
+- **OS**: Windows 10 / 11 (x64)
+- **Compiler**: Visual Studio 2022 with C++20 support (`/std:c++20`)
+- **Runtime**: [Npcap](https://npcap.com/) (installed in WinPcap-compatible mode)
+- **Privileges**: Administrator privileges (required for raw adapter access)
 
 ### macOS
-- macOS 12+ (Apple Silicon or Intel)
-- Apple Clang with C++20 (`clang++ -std=c++20`, via `xcode-select --install`)
-- Built-in system `libpcap` (pre-installed on all Macs)
-- `sudo` / root privileges (required for raw `/dev/bpf*` packet access)
+- **OS**: macOS 12+ (Apple Silicon or Intel)
+- **Compiler**: Apple Clang with C++20 (`xcode-select --install`)
+- **Runtime**: Built-in system `libpcap` (pre-installed on all macOS versions)
+- **Privileges**: `sudo` / root privileges (required for `/dev/bpf*` packet capture/injection)
 
 ---
 
@@ -83,55 +125,15 @@ Each transmitted frame is encapsulated in a standard Ethernet II frame using the
 
 ### 1. Include the Header
 
-Copy [`libl2.h`](src/libl2.h) into your project. Include Windows sockets and the header:
+Copy [`src/libl2.h`](src/libl2.h) into your project:
 
 ```cpp
 #include "libl2.h"
 ```
 
-### 2. Sending Data
+### 2. Sending with Automatic Peer Discovery
 
-```cpp
-#include "libl2.h"
-#include <iostream>
-
-int main() {
-    // 1. Discover adapters
-    auto adapters = l2::list_adapters();
-    if (adapters.empty()) {
-        std::cerr << "No adapters found or Npcap not installed.\n";
-        return 1;
-    }
-
-    // 2. Configure channel
-    l2::L2Channel channel;
-    l2::L2Channel::Config config;
-    config.adapter  = adapters[0].name;                         // Target Npcap adapter
-    config.peer_mac = l2::parse_mac("00:11:22:33:44:55");       // Destination MAC
-    config.padding  = true;                                     // Enable traffic masking
-
-    // 256-bit pre-shared key
-    static const uint8_t PSK[l2::KEY_SIZE] = {
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-        0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
-    };
-    std::memcpy(config.key, PSK, l2::KEY_SIZE);
-
-    if (!channel.open(config)) {
-        std::cerr << "Open failed: " << channel.last_error() << "\n";
-        return 1;
-    }
-
-    // 3. Send text, binary data, or JPEG
-    channel.send("Hello from Layer 2!");
-    channel.close();
-    return 0;
-}
-```
-
-### 3. Receiving Data
+No destination MAC needed—the sender broadcasts an encrypted discovery ping, auto-detects the receiver, and immediately switches to direct stealth unicast:
 
 ```cpp
 #include "libl2.h"
@@ -144,7 +146,15 @@ int main() {
     l2::L2Channel channel;
     l2::L2Channel::Config config;
     config.adapter  = adapters[0].name;
-    config.peer_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Accept broadcast / any peer
+    config.padding  = true;
+
+    // 256-bit pre-shared key
+    static const uint8_t PSK[l2::KEY_SIZE] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+        0x13, 0x37, 0x42, 0x00, 0xBE, 0xEF, 0xF0, 0x0D
+    };
     std::memcpy(config.key, PSK, l2::KEY_SIZE);
 
     if (!channel.open(config)) {
@@ -152,16 +162,54 @@ int main() {
         return 1;
     }
 
-    // Blocking receive loop
-    channel.recv_loop([](const l2::ReceivedMessage& msg) {
-        std::cout << "Received " << msg.data.size() << " bytes from "
-                  << l2::mac_to_string(msg.sender_mac) << "\n";
+    // Auto-discover peer on the local network
+    std::cout << "Searching for peers...\n";
+    auto peer_mac = channel.discover_peer(2000);
+    if (peer_mac) {
+        channel.set_peer_mac(*peer_mac);
+        std::cout << "Connected to peer: " << l2::mac_to_string(*peer_mac) << "\n";
+        
+        // Transmit text, raw binary, or JPEG buffers via direct unicast
+        channel.send("Hello from Layer 2!");
+    }
 
+    channel.close();
+    return 0;
+}
+```
+
+### 3. Receiving / Listening
+
+The receiver listens in promiscuous mode and automatically responds to discovery beacons from authorized peers:
+
+```cpp
+#include "libl2.h"
+#include <iostream>
+
+int main() {
+    auto adapters = l2::list_adapters();
+    if (adapters.empty()) return 1;
+
+    l2::L2Channel channel;
+    l2::L2Channel::Config config;
+    config.adapter              = adapters[0].name;
+    config.peer_mac             = l2::BROADCAST_MAC; // Accept from any peer with matching PSK
+    config.auto_discovery_reply = true;              // Auto-announce to authorized senders
+    config.node_name            = "Alice";           // Friendly node identifier
+    std::memcpy(config.key, PSK, l2::KEY_SIZE);
+
+    if (!channel.open(config)) return 1;
+
+    std::cout << "Listening as '" << channel.node_name() << "' on " 
+              << l2::mac_to_string(channel.local_mac()) << "...\n";
+
+    channel.recv_loop([](const l2::ReceivedMessage& msg) {
         if (msg.type == l2::MsgType::Text) {
             std::string text(msg.data.begin(), msg.data.end());
-            std::cout << "Content: " << text << "\n";
+            std::cout << "[TEXT from " << l2::mac_to_string(msg.sender_mac) << "]: " 
+                      << text << "\n";
         }
-        return true; // Return false to break out of loop
+        return true; // Return false to exit loop
     });
 
     channel.close();
@@ -171,9 +219,9 @@ int main() {
 
 ---
 
-## Building the Example
+## Building the Example CLI
 
-The repository includes a ready-to-run interactive CLI demonstration in [`src/example.cpp`](src/example.cpp).
+The repository includes a ready-to-use interactive CLI demo in [`src/example.cpp`](src/example.cpp).
 
 ### Building on Windows
 
@@ -196,8 +244,7 @@ make
 
 #### Using CMake
 ```bash
-cmake -B build
-cmake --build build
+cmake -B build && cmake --build build
 ```
 
 #### Direct Clang Compilation
@@ -207,30 +254,49 @@ clang++ -std=c++20 -O2 -Isrc src/example.cpp -o lib-l2
 
 ---
 
-### Running the Demo
+## Running the Demo
 
-#### On Windows (Run Command Prompt / Terminal as Administrator)
+### On Windows (Run Command Prompt / PowerShell as Administrator)
 ```cmd
-# 1. List adapters:
+# 1. List available network interfaces:
 output\lib-l2.exe
 
-# 2. Start receiver:
+# 2. Start receiver (auto-replies to discovery beacons):
 output\lib-l2.exe recv <adapter_index> [node_name]
 
-# 3. Start sender (auto-discovers receiver and connects via stealth unicast):
+# 3. Start sender (auto-discovers peer and switches to stealth unicast):
 output\lib-l2.exe send <adapter_index>
 ```
 
-#### On macOS (Run Terminal with sudo)
+### On macOS (Run Terminal with sudo)
 ```bash
-# 1. List adapters:
+# 1. List available network interfaces (e.g. en0):
 sudo ./lib-l2
 
 # 2. Start receiver:
 sudo ./lib-l2 recv <adapter_index> [node_name]
 
-# 3. Start sender (auto-discovers receiver and connects via stealth unicast):
+# 3. Start sender (auto-discovers peer over LAN):
 sudo ./lib-l2 send <adapter_index>
+```
+
+### Discovery Terminal Walkthrough
+```text
+C:\lib-l2> output\lib-l2.exe send 0
+[OK] Channel open on Realtek PCIe GbE Family Controller
+     Local MAC : 00:19:db:f3:ee:1b
+     Node Name : DESKTOP-MAIN
+
+[*] No destination MAC specified. Discovering peers on network...
+[+] Found 1 peer: a4:83:e7:21:40:9a ("MacBook-Pro")
+    Connected! Switched to direct stealth unicast.
+
+     Peer MAC  : a4:83:e7:21:40:9a
+     Padding   : ON
+
+Type messages to send (empty line to quit):
+Hello from Windows!
+  -> sent 19 bytes in 235 us
 ```
 
 ---
@@ -285,7 +351,7 @@ struct ReceivedMessage {
 #### `l2::AdapterInfo`
 ```cpp
 struct AdapterInfo {
-    std::string name;        // Npcap device path (pass to Config::adapter)
+    std::string name;        // System adapter identifier (pass to Config::adapter)
     std::string description; // Human-friendly device name
     Mac         mac;         // Interface hardware MAC address
 };
@@ -294,7 +360,7 @@ struct AdapterInfo {
 #### `l2::L2Channel::Config`
 ```cpp
 struct Config {
-    std::string adapter;                 // Npcap device name (from list_adapters)
+    std::string adapter;                 // System device name (from list_adapters)
     Mac         peer_mac{};              // Destination MAC address
     uint8_t     key[KEY_SIZE]{};         // Pre-shared 256-bit encryption key
     Mac         local_mac{};             // Custom local MAC override (empty = auto-detect)
@@ -303,7 +369,7 @@ struct Config {
     size_t      max_pad    = 8;          // Max padding bytes to append
     int         read_timeout_ms = 1;     // pcap read timeout in ms (default: 1)
     bool        auto_discovery_reply = true; // Auto-reply to discovery beacons
-    std::string node_name;               // Friendly name (defaults to Windows COMPUTERNAME)
+    std::string node_name;               // Friendly name (defaults to system hostname)
 };
 ```
 
