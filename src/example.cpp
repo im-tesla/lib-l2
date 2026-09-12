@@ -4,9 +4,11 @@
 #include <cstdlib>
 
 static int wait_exit(int code) {
+#ifdef _WIN32
     std::cout << "\nPress Enter twice to exit...";
     std::cin.ignore(0x7FFFFFFF, '\n');
     std::cin.get();
+#endif
     return code;
 }
 
@@ -177,8 +179,13 @@ static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
 int main(int argc, char* argv[]) {
     auto adapters = l2::list_adapters();
     if (adapters.empty()) {
+#ifdef _WIN32
         std::cerr << "No network adapters found.\n"
                   << "Make sure Npcap is installed and you are running as Administrator.\n";
+#else
+        std::cerr << "No network adapters found.\n"
+                  << "Make sure you run with sudo (root permissions required for raw capture on macOS/Linux).\n";
+#endif
         return wait_exit(1);
     }
 

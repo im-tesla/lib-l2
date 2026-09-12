@@ -1,13 +1,35 @@
 #pragma once
 
+#ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
-
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+#else // macOS / Linux / POSIX
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <ifaddrs.h>
+
+#if defined(__APPLE__)
+#include <net/if.h>
+#include <net/if_dl.h>
+#elif defined(__linux__)
+#include <net/if.h>
+#include <sys/ioctl.h>
+#endif
+
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -22,9 +44,6 @@
 #include <optional>
 #include <functional>
 #include <atomic>
-
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "ws2_32.lib")
 
 namespace l2 {
 
@@ -219,7 +238,11 @@ using fn_datalink       = int(*)(Handle);
 using fn_setmintocopy   = int(*)(Handle, int);
 
 struct Library {
+#ifdef _WIN32
     HMODULE           dll           = nullptr;
+#else
+    void*             dll           = nullptr;
+#endif
     fn_open_live      open_live     = nullptr;
     fn_findalldevs    findalldevs   = nullptr;
     fn_freealldevs    freealldevs   = nullptr;
@@ -237,6 +260,7 @@ struct Library {
     bool load() {
         if (loaded) return true;
 
+#ifdef _WIN32
         char sys_dir[512]{};
         UINT len = GetSystemDirectoryA(sys_dir, sizeof(sys_dir));
         if (len > 0 && len < sizeof(sys_dir) - 16) {
@@ -250,6 +274,26 @@ struct Library {
         if (!dll) return false;
 
         auto get = [&](const char* n) { return GetProcAddress(dll, n); };
+#else
+        const char* candidates[] = {
+            "libpcap.dylib",
+            "/usr/lib/libpcap.dylib",
+            "libpcap.A.dylib",
+            "/opt/homebrew/opt/libpcap/lib/libpcap.dylib",
+            "/usr/local/opt/libpcap/lib/libpcap.dylib",
+            "libpcap.so",
+            "libpcap.so.1",
+            "/usr/lib/x86_64-linux-gnu/libpcap.so"
+        };
+        for (const char* c : candidates) {
+            dll = dlopen(c, RTLD_LAZY);
+            if (dll) break;
+        }
+
+        if (!dll) return false;
+
+        auto get = [&](const char* n) { return dlsym(dll, n); };
+#endif
 
         open_live    = (fn_open_live)   get("pcap_open_live");
         findalldevs  = (fn_findalldevs) get("pcap_findalldevs");
@@ -268,11 +312,24 @@ struct Library {
                  next_ex && close && compile && setfilter && freecode &&
                  geterr && datalink;
 
-        if (!loaded) { FreeLibrary(dll); dll = nullptr; }
+        if (!loaded) {
+#ifdef _WIN32
+            FreeLibrary(dll);
+#else
+            dlclose(dll);
+#endif
+            dll = nullptr;
+        }
         return loaded;
     }
 
-    ~Library() { if (dll) FreeLibrary(dll); }
+    ~Library() {
+#ifdef _WIN32
+        if (dll) FreeLibrary(dll);
+#else
+        if (dll) dlclose(dll);
+#endif
+    }
 };
 
 inline Library& lib() {
@@ -300,6 +357,7 @@ inline std::string mac_to_string(const Mac& m) {
 }
 
 inline bool get_adapter_mac(const std::string& pcap_name, Mac& out) {
+#ifdef _WIN32
     std::string target_guid = detail::extract_guid(pcap_name);
     if (target_guid.empty()) return false;
 
@@ -325,6 +383,39 @@ inline bool get_adapter_mac(const std::string& pcap_name, Mac& out) {
         }
     }
     return false;
+#elif defined(__APPLE__)
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) != 0 || !ifap) return false;
+
+    bool found = false;
+    for (auto* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (pcap_name == ifa->ifa_name && ifa->ifa_addr->sa_family == AF_LINK) {
+            auto* sdl = reinterpret_cast<struct sockaddr_dl*>(ifa->ifa_addr);
+            if (sdl->sdl_alen == 6) {
+                std::memcpy(out.data(), LLADDR(sdl), 6);
+                found = true;
+                break;
+            }
+        }
+    }
+    freeifaddrs(ifap);
+    return found;
+#elif defined(__linux__)
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+    struct ifreq ifr{};
+    std::strncpy(ifr.ifr_name, pcap_name.c_str(), sizeof(ifr.ifr_name) - 1);
+    bool found = false;
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) >= 0) {
+        std::memcpy(out.data(), ifr.ifr_hwaddr.sa_data, 6);
+        found = true;
+    }
+    close(fd);
+    return found;
+#else
+    return false;
+#endif
 }
 
 inline std::vector<AdapterInfo> list_adapters() {
@@ -553,13 +644,20 @@ public:
 
     bool open(const Config& cfg) {
         if (!pcap::lib().load()) {
+#ifdef _WIN32
             last_error_ = "Failed to load Npcap (wpcap.dll). Is Npcap installed?";
+#elif defined(__APPLE__)
+            last_error_ = "Failed to load libpcap (libpcap.dylib). Ensure libpcap is available.";
+#else
+            last_error_ = "Failed to load libpcap (libpcap.so). Ensure libpcap is installed.";
+#endif
             return false;
         }
 
         cfg_ = cfg;
 
         if (cfg_.node_name.empty()) {
+#ifdef _WIN32
             char comp_name[MAX_COMPUTERNAME_LENGTH + 1]{};
             DWORD comp_size = sizeof(comp_name);
             if (GetComputerNameA(comp_name, &comp_size)) {
@@ -567,6 +665,15 @@ public:
             } else {
                 cfg_.node_name = "node";
             }
+#else
+            char host_buf[256]{};
+            if (gethostname(host_buf, sizeof(host_buf)) == 0 && host_buf[0] != '\0') {
+                cfg_.node_name = host_buf;
+            } else {
+                const char* user = std::getenv("USER");
+                cfg_.node_name = user ? user : "node";
+            }
+#endif
         }
 
         if (cfg_.random_mac) {

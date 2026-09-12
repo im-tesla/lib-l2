@@ -1,6 +1,6 @@
 # lib-l2
 
-A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Data Link)** communication on Windows.
+A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Data Link)** communication on Windows and macOS (with Linux support).
 
 `lib-l2` transmits data directly over raw Ethernet frames, completely bypassing the Layer 3 (IP) and Layer 4 (TCP/UDP) network stacks. Because it does not use IP addresses, port numbers, or standard transport handshakes, it operates beneath standard OS socket layers and packet filtering rules.
 
@@ -8,7 +8,7 @@ A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Da
 
 ## Features
 
-- **Header-Only & Zero Build Dependencies**: Just drop [`libl2.h`](src/libl2.h) into your project. Dynamically loads Npcap (`wpcap.dll`) at runtime—no need to install the Npcap SDK, configure header search paths, or link `wpcap.lib`.
+- **Cross-Platform & Header-Only**: Just include [`libl2.h`](src/libl2.h). Dynamically loads the platform packet capture library at runtime—**Npcap** (`wpcap.dll`) on Windows, and built-in **libpcap** (`libpcap.dylib`) on macOS. Zero build SDKs or static link dependencies required.
 - **Pure Layer 2 Networking**: Operates directly on raw Ethernet frames (EtherType `0x88B7`, IEC 61850 GOOSE). Bypasses IP routing, ARP tables, OS firewalls, and port scanners.
 - **Automatic Peer Discovery**: No need to manually look up or type destination MAC addresses. Nodes broadcast encrypted discovery beacons (`ControlCmd::DiscoveryRequest`) and automatically reply with their friendly node names, seamlessly switching to stealth unicast for ongoing communication.
 - **Strong Encryption**: End-to-end payload and metadata encryption using **ChaCha20** (256-bit pre-shared key, 96-bit random per-frame nonce).
@@ -17,7 +17,7 @@ A lightweight, header-only C++20 library for covert, encrypted raw **Layer 2 (Da
   - **Random Padding**: Configurable per-frame random padding (default up to 8 bytes) to obscure exact packet sizes and prevent size-based fingerprinting.
   - **Ephemeral MAC Spoofing**: Supports generating random locally-administered unicast MAC addresses per session or specifying custom static MACs.
 - **Automatic Fragmentation & Reassembly**: Transparently splits messages exceeding the standard Ethernet MTU (1500 bytes) into multiple fragments and reassembles them in memory with automatic stale-packet purging.
-- **Low-Latency & Kernel BPF Filtering**: Utilizes Npcap BPF kernel filtering (`ether[12:2] = 0x88b7`) to discard non-matching traffic in the driver before reaching user space, with minimal copy buffer delays (`pcap_setmintocopy(1)`).
+- **Low-Latency & Kernel BPF Filtering**: Utilizes BPF kernel filtering (`ether[12:2] = 0x88b7`) to discard non-matching traffic in the driver before reaching user space, with minimal buffer delays.
 
 ---
 
@@ -65,9 +65,17 @@ Each transmitted frame is encapsulated in a standard Ethernet II frame using the
 
 ## Requirements
 
-- **Operating System**: Windows 10 / 11 (x64)
-- **Compiler**: Visual Studio 2022 or MSVC with **C++20** support (`/std:c++20`)
-- **Runtime**: [Npcap](https://npcap.com/)
+### Windows
+- Windows 10 / 11 (x64)
+- Visual Studio 2022 with C++20 (`/std:c++20`)
+- [Npcap](https://npcap.com/) (installed in WinPcap-compatible mode)
+- Administrator privileges (for raw packet capture)
+
+### macOS
+- macOS 12+ (Apple Silicon or Intel)
+- Apple Clang with C++20 (`clang++ -std=c++20`, via `xcode-select --install`)
+- Built-in system `libpcap` (pre-installed on all Macs)
+- `sudo` / root privileges (required for raw `/dev/bpf*` packet access)
 
 ---
 
@@ -167,41 +175,63 @@ int main() {
 
 The repository includes a ready-to-run interactive CLI demonstration in [`src/example.cpp`](src/example.cpp).
 
-### Using Visual Studio
+### Building on Windows
+
+#### Using Visual Studio
 1. Open [`lib-l2.slnx`](lib-l2.slnx) in Visual Studio 2022.
 2. Select **Release** and **x64**.
-3. Build the solution (`Ctrl + Shift + B`). Output executable is located at `output/lib-l2.exe`.
+3. Build the solution (`Ctrl + Shift + B`). Executable will be in `output\lib-l2.exe`.
 
-### Using MSBuild
-Open a "Developer Command Prompt for VS 2022" and run:
-
+#### Using MSBuild
 ```cmd
 msbuild src\lib-l2.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
+### Building on macOS / Linux
+
+#### Using Make
+```bash
+make
+```
+
+#### Using CMake
+```bash
+cmake -B build
+cmake --build build
+```
+
+#### Direct Clang Compilation
+```bash
+clang++ -std=c++20 -O2 -Isrc src/example.cpp -o lib-l2
+```
+
+---
+
 ### Running the Demo
 
-> **Note**: An elevated terminal (Run as Administrator) is required for raw network interface binding.
+#### On Windows (Run Command Prompt / Terminal as Administrator)
+```cmd
+# 1. List adapters:
+output\lib-l2.exe
 
-1. **List adapters**: Run the executable without arguments to print available network interfaces and their index numbers:
-   ```cmd
-   output\lib-l2.exe
-   ```
+# 2. Start receiver:
+output\lib-l2.exe recv <adapter_index> [node_name]
 
-2. **Start Receiver** (on Machine A or Interface A):
-   ```cmd
-   output\lib-l2.exe recv <adapter_index> [node_name]
-   ```
-   *The receiver automatically replies to encrypted discovery beacons from senders.*
+# 3. Start sender (auto-discovers receiver and connects via stealth unicast):
+output\lib-l2.exe send <adapter_index>
+```
 
-3. **Start Sender** (on Machine B or Interface B):
-   ```cmd
-   # Auto-discovers receiver and connects via stealth unicast automatically:
-   output\lib-l2.exe send <adapter_index>
+#### On macOS (Run Terminal with sudo)
+```bash
+# 1. List adapters:
+sudo ./lib-l2
 
-   # Or specify target MAC directly:
-   output\lib-l2.exe send <adapter_index> <receiver_mac>
-   ```
+# 2. Start receiver:
+sudo ./lib-l2 recv <adapter_index> [node_name]
+
+# 3. Start sender (auto-discovers receiver and connects via stealth unicast):
+sudo ./lib-l2 send <adapter_index>
+```
 
 ---
 
