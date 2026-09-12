@@ -1,0 +1,752 @@
+#pragma once
+
+#define _CRT_SECURE_NO_WARNINGS
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <winsock2.h>
+#include <windows.h>
+#include <iphlpapi.h>
+
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <vector>
+#include <array>
+#include <string>
+#include <unordered_map>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <optional>
+#include <functional>
+#include <atomic>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+namespace l2 {
+
+inline constexpr uint16_t ETHER_TYPE         = 0x88B7;   // IEC 61850 GOOSE
+inline constexpr uint16_t FRAME_MAGIC        = 0x4C32;   // "L2"
+inline constexpr size_t   MAC_LEN            = 6;
+inline constexpr size_t   ETH_HDR_SIZE       = 14;       // dst(6) + src(6) + type(2)
+inline constexpr size_t   NONCE_SIZE         = 12;       // ChaCha20 nonce
+inline constexpr size_t   MAGIC_SIZE         = 2;
+inline constexpr size_t   INNER_HDR_SIZE     = 16;       // encrypted inner header
+inline constexpr size_t   CLEAR_OVERHEAD     = ETH_HDR_SIZE + MAGIC_SIZE + NONCE_SIZE; // 28
+inline constexpr size_t   TOTAL_OVERHEAD     = CLEAR_OVERHEAD + INNER_HDR_SIZE;         // 44
+inline constexpr size_t   MAX_ETH_FRAME      = 1500;
+inline constexpr size_t   MAX_FRAG_PAYLOAD   = MAX_ETH_FRAME - TOTAL_OVERHEAD;          // 1456
+inline constexpr size_t   KEY_SIZE           = 32;       // ChaCha20 key size
+inline constexpr size_t   DEFAULT_MAX_PAD    = 8;        // max random padding bytes
+
+using Mac = std::array<uint8_t, 6>;
+
+enum class MsgType : uint8_t {
+    Text    = 0x01,
+    Jpeg    = 0x02,
+    Binary  = 0x03,
+    Control = 0xFF,
+};
+
+enum class MsgFlags : uint8_t {
+    None = 0x00,
+};
+
+struct ReceivedMessage {
+    MsgType              type;
+    std::vector<uint8_t> data;
+    Mac                  sender_mac;
+};
+
+struct AdapterInfo {
+    std::string name;        // pcap device name (pass to Config::adapter)
+    std::string description; // human-readable adapter name
+    Mac         mac;         // hardware MAC address
+};
+
+namespace detail {
+
+inline uint32_t load_le32(const uint8_t* p) {
+    return uint32_t(p[0])        | (uint32_t(p[1]) << 8) |
+           (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+inline void store_le32(uint8_t* p, uint32_t v) {
+    p[0] = uint8_t(v);       p[1] = uint8_t(v >> 8);
+    p[2] = uint8_t(v >> 16); p[3] = uint8_t(v >> 24);
+}
+
+inline void write_be16(uint8_t* p, uint16_t v) {
+    p[0] = uint8_t(v >> 8); p[1] = uint8_t(v);
+}
+inline void write_be32(uint8_t* p, uint32_t v) {
+    p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16);
+    p[2] = uint8_t(v >> 8);  p[3] = uint8_t(v);
+}
+inline uint16_t read_be16(const uint8_t* p) {
+    return (uint16_t(p[0]) << 8) | p[1];
+}
+inline uint32_t read_be32(const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+           (uint32_t(p[2]) << 8)  | p[3];
+}
+
+inline uint32_t rotl32(uint32_t v, int n) {
+    return (v << n) | (v >> (32 - n));
+}
+
+inline void qr(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+    a += b; d ^= a; d = rotl32(d, 16);
+    c += d; b ^= c; b = rotl32(b, 12);
+    a += b; d ^= a; d = rotl32(d, 8);
+    c += d; b ^= c; b = rotl32(b, 7);
+}
+
+inline void chacha20_block(const uint32_t key[8], uint32_t ctr,
+                           const uint32_t nonce[3], uint8_t out[64]) {
+    uint32_t s[16] = {
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,  // "expand 32-byte k"
+        key[0], key[1], key[2], key[3],
+        key[4], key[5], key[6], key[7],
+        ctr, nonce[0], nonce[1], nonce[2]
+    };
+    uint32_t w[16];
+    std::memcpy(w, s, 64);
+
+    for (int i = 0; i < 10; ++i) {      // 20 rounds = 10 double-rounds
+        qr(w[0],w[4],w[8], w[12]); qr(w[1],w[5],w[9], w[13]);
+        qr(w[2],w[6],w[10],w[14]); qr(w[3],w[7],w[11],w[15]);
+        qr(w[0],w[5],w[10],w[15]); qr(w[1],w[6],w[11],w[12]);
+        qr(w[2],w[7],w[8], w[13]); qr(w[3],w[4],w[9], w[14]);
+    }
+    for (int i = 0; i < 16; ++i)
+        store_le32(out + 4 * i, w[i] + s[i]);
+}
+
+inline void chacha20_crypt(const uint8_t key[32], const uint8_t nonce[12],
+                           const uint8_t* in, uint8_t* out, size_t len) {
+    uint32_t k[8], n[3];
+    for (int i = 0; i < 8; ++i) k[i] = load_le32(key + 4 * i);
+    for (int i = 0; i < 3; ++i) n[i] = load_le32(nonce + 4 * i);
+
+    uint8_t ks[64];
+    for (uint32_t ctr = 0; len > 0; ++ctr) {
+        chacha20_block(k, ctr, n, ks);
+        size_t chunk = std::min(len, size_t(64));
+        for (size_t i = 0; i < chunk; ++i)
+            out[i] = in[i] ^ ks[i];
+        in  += chunk;
+        out += chunk;
+        len -= chunk;
+    }
+}
+
+inline uint32_t fnv1a(const uint8_t* data, size_t len) {
+    uint32_t h = 0x811C9DC5u;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+inline std::string extract_guid(const std::string& s) {
+    auto a = s.find('{');
+    auto b = s.find('}', a != std::string::npos ? a : 0);
+    if (a != std::string::npos && b != std::string::npos)
+        return s.substr(a + 1, b - a - 1);
+    return s;
+}
+
+} // namespace detail
+
+namespace pcap {
+
+struct pcap_if_t {
+    pcap_if_t*  next;
+    char*       name;
+    char*       description;
+    void*       addresses;    // pcap_addr* — unused
+    uint32_t    flags;
+};
+
+struct PktHdr {
+    struct timeval ts;
+    uint32_t caplen;
+    uint32_t len;
+};
+
+struct BpfInsn {
+    uint16_t code;
+    uint8_t  jt;
+    uint8_t  jf;
+    uint32_t k;
+};
+
+struct BpfProgram {
+    uint32_t bf_len;
+    BpfInsn* bf_insns;
+};
+
+using Handle = void*;
+
+using fn_open_live      = Handle(*)(const char*, int, int, int, char*);
+using fn_findalldevs    = int(*)(pcap_if_t**, char*);
+using fn_freealldevs    = void(*)(pcap_if_t*);
+using fn_sendpacket     = int(*)(Handle, const uint8_t*, int);
+using fn_next_ex        = int(*)(Handle, PktHdr**, const uint8_t**);
+using fn_close          = void(*)(Handle);
+using fn_compile        = int(*)(Handle, BpfProgram*, const char*, int, uint32_t);
+using fn_setfilter      = int(*)(Handle, BpfProgram*);
+using fn_freecode       = void(*)(BpfProgram*);
+using fn_geterr         = char*(*)(Handle);
+using fn_datalink       = int(*)(Handle);
+using fn_setmintocopy   = int(*)(Handle, int);
+
+struct Library {
+    HMODULE           dll           = nullptr;
+    fn_open_live      open_live     = nullptr;
+    fn_findalldevs    findalldevs   = nullptr;
+    fn_freealldevs    freealldevs   = nullptr;
+    fn_sendpacket     sendpacket    = nullptr;
+    fn_next_ex        next_ex       = nullptr;
+    fn_close          close         = nullptr;
+    fn_compile        compile       = nullptr;
+    fn_setfilter      setfilter     = nullptr;
+    fn_freecode       freecode      = nullptr;
+    fn_geterr         geterr        = nullptr;
+    fn_datalink       datalink      = nullptr;
+    fn_setmintocopy   setmintocopy  = nullptr;
+    bool              loaded        = false;
+
+    bool load() {
+        if (loaded) return true;
+
+        char sys_dir[512]{};
+        UINT len = GetSystemDirectoryA(sys_dir, sizeof(sys_dir));
+        if (len > 0 && len < sizeof(sys_dir) - 16) {
+            std::string npcap_dir = std::string(sys_dir) + "\\Npcap";
+            SetDllDirectoryA(npcap_dir.c_str());
+        }
+
+        dll = LoadLibraryA("wpcap.dll");
+        SetDllDirectoryA(nullptr);
+
+        if (!dll) return false;
+
+        auto get = [&](const char* n) { return GetProcAddress(dll, n); };
+
+        open_live    = (fn_open_live)   get("pcap_open_live");
+        findalldevs  = (fn_findalldevs) get("pcap_findalldevs");
+        freealldevs  = (fn_freealldevs) get("pcap_freealldevs");
+        sendpacket   = (fn_sendpacket)  get("pcap_sendpacket");
+        next_ex      = (fn_next_ex)     get("pcap_next_ex");
+        close        = (fn_close)       get("pcap_close");
+        compile      = (fn_compile)     get("pcap_compile");
+        setfilter    = (fn_setfilter)   get("pcap_setfilter");
+        freecode     = (fn_freecode)    get("pcap_freecode");
+        geterr       = (fn_geterr)      get("pcap_geterr");
+        datalink     = (fn_datalink)    get("pcap_datalink");
+        setmintocopy = (fn_setmintocopy)get("pcap_setmintocopy");
+
+        loaded = open_live && findalldevs && freealldevs && sendpacket &&
+                 next_ex && close && compile && setfilter && freecode &&
+                 geterr && datalink;
+
+        if (!loaded) { FreeLibrary(dll); dll = nullptr; }
+        return loaded;
+    }
+
+    ~Library() { if (dll) FreeLibrary(dll); }
+};
+
+inline Library& lib() {
+    static Library instance;
+    return instance;
+}
+
+} // namespace pcap
+
+inline Mac parse_mac(const std::string& str) {
+    Mac m{};
+    unsigned b[6]{};
+    if (sscanf(str.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < 6; ++i) m[i] = uint8_t(b[i]);
+    }
+    return m;
+}
+
+inline std::string mac_to_string(const Mac& m) {
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    return buf;
+}
+
+inline bool get_adapter_mac(const std::string& pcap_name, Mac& out) {
+    std::string target_guid = detail::extract_guid(pcap_name);
+    if (target_guid.empty()) return false;
+
+    ULONG buf_len = 15000;
+    std::vector<uint8_t> buf(buf_len);
+    auto* addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+
+    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, addrs, &buf_len);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(buf_len);
+        addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+        rc = GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, addrs, &buf_len);
+    }
+    if (rc != NO_ERROR) return false;
+
+    for (auto* a = addrs; a; a = a->Next) {
+        if (a->PhysicalAddressLength == 6) {
+            std::string adapter_guid = detail::extract_guid(a->AdapterName);
+            if (_stricmp(adapter_guid.c_str(), target_guid.c_str()) == 0) {
+                std::memcpy(out.data(), a->PhysicalAddress, 6);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline std::vector<AdapterInfo> list_adapters() {
+    std::vector<AdapterInfo> result;
+    if (!pcap::lib().load()) return result;
+
+    char errbuf[256]{};
+    pcap::pcap_if_t* devs = nullptr;
+    if (pcap::lib().findalldevs(&devs, errbuf) != 0 || !devs)
+        return result;
+
+    for (auto* d = devs; d; d = d->next) {
+        AdapterInfo info;
+        info.name        = d->name        ? d->name        : "";
+        info.description = d->description ? d->description : "(no description)";
+        info.mac = {};
+        get_adapter_mac(info.name, info.mac);
+        if (info.mac != Mac{})
+            result.push_back(std::move(info));
+    }
+
+    pcap::lib().freealldevs(devs);
+    return result;
+}
+
+namespace frame {
+
+struct InnerHeader {
+    uint32_t msg_id;
+    uint16_t frag_idx;
+    uint16_t frag_total;
+    MsgType  msg_type;
+    MsgFlags flags;
+    uint16_t payload_len;
+};
+
+inline size_t build(const Mac& dst, const Mac& src,
+                    const uint8_t key[KEY_SIZE],
+                    const InnerHeader& hdr,
+                    const uint8_t* payload,
+                    uint8_t* out,
+                    std::mt19937& rng,
+                    size_t max_pad) {
+    uint8_t* p = out;
+
+    std::memcpy(p, dst.data(), 6); p += 6;
+    std::memcpy(p, src.data(), 6); p += 6;
+    detail::write_be16(p, ETHER_TYPE); p += 2;
+
+    detail::write_be16(p, FRAME_MAGIC); p += 2;
+
+    uint8_t nonce[NONCE_SIZE];
+    std::uniform_int_distribution<uint32_t> byte_dist(0, 255);
+    for (auto& b : nonce) b = uint8_t(byte_dist(rng));
+    std::memcpy(p, nonce, NONCE_SIZE); p += NONCE_SIZE;
+
+    size_t avail_for_pad = MAX_FRAG_PAYLOAD - hdr.payload_len;
+    size_t pad_len = 0;
+    if (max_pad > 0 && avail_for_pad > 0)
+        pad_len = std::uniform_int_distribution<size_t>(0, std::min(max_pad, avail_for_pad))(rng);
+
+    size_t plain_len = INNER_HDR_SIZE + hdr.payload_len + pad_len;
+    uint8_t plain[MAX_ETH_FRAME];   // stack buffer (max ~1472 bytes used)
+
+    uint8_t* h = plain;
+    detail::write_be32(h, hdr.msg_id);          h += 4;
+    detail::write_be16(h, hdr.frag_idx);        h += 2;
+    detail::write_be16(h, hdr.frag_total);      h += 2;
+    *h++ = uint8_t(hdr.msg_type);
+    *h++ = uint8_t(hdr.flags);
+    detail::write_be16(h, hdr.payload_len);     h += 2;
+    uint32_t check = detail::fnv1a(plain, 12);
+    detail::write_be32(h, check);               h += 4;
+
+    if (hdr.payload_len > 0)
+        std::memcpy(h, payload, hdr.payload_len);
+    h += hdr.payload_len;
+
+    for (size_t i = 0; i < pad_len; ++i) *h++ = uint8_t(byte_dist(rng));
+
+    detail::chacha20_crypt(key, nonce, plain, p, plain_len);
+    p += plain_len;
+
+    return size_t(p - out);
+}
+
+inline bool parse(const uint8_t* frame, size_t frame_len,
+                  const uint8_t key[KEY_SIZE],
+                  Mac& sender_mac, InnerHeader& hdr,
+                  std::vector<uint8_t>& payload_out) {
+
+    if (frame_len < TOTAL_OVERHEAD) return false;
+
+    const uint8_t* p = frame;
+
+    p += 6;  // skip dst
+    std::memcpy(sender_mac.data(), p, 6); p += 6;
+
+    if (detail::read_be16(p) != ETHER_TYPE) return false;
+    p += 2;
+
+    if (detail::read_be16(p) != FRAME_MAGIC) return false;
+    p += 2;
+
+    uint8_t nonce[NONCE_SIZE];
+    std::memcpy(nonce, p, NONCE_SIZE); p += NONCE_SIZE;
+
+    size_t enc_len = frame_len - CLEAR_OVERHEAD;
+    if (enc_len < INNER_HDR_SIZE) return false;
+
+    uint8_t plain[MAX_ETH_FRAME];
+    detail::chacha20_crypt(key, nonce, p, plain, enc_len);
+
+    const uint8_t* h = plain;
+    hdr.msg_id      = detail::read_be32(h); h += 4;
+    hdr.frag_idx    = detail::read_be16(h); h += 2;
+    hdr.frag_total  = detail::read_be16(h); h += 2;
+    hdr.msg_type    = MsgType(*h++);
+    hdr.flags       = MsgFlags(*h++);
+    hdr.payload_len = detail::read_be16(h); h += 2;
+
+    uint32_t expected_check = detail::fnv1a(plain, 12);
+    uint32_t actual_check   = detail::read_be32(h); h += 4;
+    if (expected_check != actual_check) return false;  // wrong key or corruption
+
+    if (hdr.frag_total == 0) return false;
+    if (hdr.frag_idx >= hdr.frag_total) return false;
+    if (hdr.payload_len > enc_len - INNER_HDR_SIZE) return false;
+
+    payload_out.assign(h, h + hdr.payload_len);
+    return true;
+}
+
+} // namespace frame
+
+class Reassembler {
+public:
+    std::optional<ReceivedMessage> add(const Mac& sender,
+                                       const frame::InnerHeader& hdr,
+                                       const std::vector<uint8_t>& payload) {
+        auto& buf = buffers_[hdr.msg_id];
+
+        if (buf.fragments.empty()) {
+            buf.frag_total  = hdr.frag_total;
+            buf.msg_type    = hdr.msg_type;
+            buf.sender_mac  = sender;
+            buf.fragments.resize(hdr.frag_total);
+            buf.received.resize(hdr.frag_total, false);
+            buf.created     = std::chrono::steady_clock::now();
+        }
+
+        if (hdr.frag_idx >= buf.frag_total) return std::nullopt;
+
+        if (!buf.received[hdr.frag_idx]) {
+            buf.received[hdr.frag_idx] = true;
+            buf.fragments[hdr.frag_idx] = payload;
+            ++buf.count;
+        }
+
+        if (buf.count == buf.frag_total) {
+            ReceivedMessage msg;
+            msg.type       = buf.msg_type;
+            msg.sender_mac = buf.sender_mac;
+
+            size_t total = 0;
+            for (auto& f : buf.fragments) total += f.size();
+            msg.data.reserve(total);
+            for (auto& f : buf.fragments)
+                msg.data.insert(msg.data.end(), f.begin(), f.end());
+
+            buffers_.erase(hdr.msg_id);
+            return msg;
+        }
+
+        return std::nullopt;
+    }
+
+    void purge(std::chrono::seconds max_age = std::chrono::seconds(10)) {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = buffers_.begin(); it != buffers_.end(); ) {
+            if (now - it->second.created > max_age)
+                it = buffers_.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    size_t pending_count() const { return buffers_.size(); }
+
+private:
+    struct Buffer {
+        uint16_t frag_total = 0;
+        MsgType  msg_type   = MsgType::Binary;
+        Mac      sender_mac{};
+        std::vector<std::vector<uint8_t>> fragments;
+        std::vector<bool> received;
+        uint16_t count = 0;
+        std::chrono::steady_clock::time_point created;
+    };
+
+    std::unordered_map<uint32_t, Buffer> buffers_;
+};
+
+class L2Channel {
+public:
+    struct Config {
+        std::string adapter;          // pcap device name (from list_adapters)
+        Mac         peer_mac{};       // destination MAC address
+        uint8_t     key[KEY_SIZE]{};  // pre-shared 256-bit encryption key
+        Mac         local_mac{};      // custom local MAC (empty = auto-detect)
+        bool        random_mac  = false;  // generate random session MAC
+        bool        padding     = true;   // enable random per-frame padding
+        size_t      max_pad     = DEFAULT_MAX_PAD;  // max padding bytes
+        int         read_timeout_ms = 1;  // pcap read timeout (lower = less latency)
+    };
+
+    L2Channel() = default;
+    ~L2Channel() { close(); }
+
+    L2Channel(const L2Channel&)            = delete;
+    L2Channel& operator=(const L2Channel&) = delete;
+    L2Channel(L2Channel&& o) noexcept      { swap(o); }
+    L2Channel& operator=(L2Channel&& o) noexcept { swap(o); return *this; }
+
+    bool open(const Config& cfg) {
+        if (!pcap::lib().load()) {
+            last_error_ = "Failed to load Npcap (wpcap.dll). Is Npcap installed?";
+            return false;
+        }
+
+        cfg_ = cfg;
+
+        if (cfg_.random_mac) {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint32_t> d(0, 255);
+            for (auto& b : local_mac_) b = uint8_t(d(gen));
+            local_mac_[0] &= 0xFE;  // unicast bit
+            local_mac_[0] |= 0x02;  // locally-administered bit
+        } else if (cfg_.local_mac != Mac{}) {
+            local_mac_ = cfg_.local_mac;
+        } else {
+            if (!get_adapter_mac(cfg_.adapter, local_mac_)) {
+                last_error_ = "Cannot determine adapter MAC. Specify local_mac manually.";
+                return false;
+            }
+        }
+
+        char errbuf[256]{};
+        handle_ = pcap::lib().open_live(
+            cfg_.adapter.c_str(),
+            MAX_ETH_FRAME + 64,       // snaplen
+            1,                         // promiscuous
+            cfg_.read_timeout_ms,      // read timeout (ms)
+            errbuf
+        );
+        if (!handle_) {
+            last_error_ = std::string("pcap_open_live: ") + errbuf;
+            return false;
+        }
+
+        if (pcap::lib().datalink(handle_) != 1 /* DLT_EN10MB */) {
+            last_error_ = "Adapter is not Ethernet (DLT_EN10MB required)";
+            pcap::lib().close(handle_);
+            handle_ = nullptr;
+            return false;
+        }
+
+        if (pcap::lib().setmintocopy)
+            pcap::lib().setmintocopy(handle_, 1);
+
+        pcap::BpfProgram bpf{};
+        const char* filter = "ether[12:2] = 0x88b7";
+        if (pcap::lib().compile(handle_, &bpf, filter, 1, 0) == 0) {
+            pcap::lib().setfilter(handle_, &bpf);
+            pcap::lib().freecode(&bpf);
+        }
+
+        std::random_device rd;
+        rng_.seed(rd());
+        msg_counter_ = std::uniform_int_distribution<uint32_t>(1, UINT32_MAX / 2)(rng_);
+        purge_counter_ = 0;
+
+        open_ = true;
+        return true;
+    }
+
+    void close() {
+        if (handle_) {
+            pcap::lib().close(handle_);
+            handle_ = nullptr;
+        }
+        open_ = false;
+    }
+
+    bool is_open() const { return open_; }
+    const Mac& local_mac() const { return local_mac_; }
+    const std::string& last_error() const { return last_error_; }
+
+    bool send(const void* data, size_t len, MsgType type) {
+        if (!open_) { last_error_ = "Channel not open"; return false; }
+
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        uint32_t msg_id = msg_counter_++;
+
+        size_t max_payload = cfg_.padding
+            ? (MAX_FRAG_PAYLOAD - cfg_.max_pad)
+            : MAX_FRAG_PAYLOAD;
+
+        uint16_t frag_total = uint16_t(len > 0 ? (len + max_payload - 1) / max_payload : 1);
+
+        uint8_t frame_buf[MAX_ETH_FRAME + 64];
+
+        for (uint16_t i = 0; i < frag_total; ++i) {
+            size_t offset = size_t(i) * max_payload;
+            size_t chunk  = (len > 0) ? std::min(max_payload, len - offset) : 0;
+
+            frame::InnerHeader hdr{};
+            hdr.msg_id      = msg_id;
+            hdr.frag_idx    = i;
+            hdr.frag_total  = frag_total;
+            hdr.msg_type    = type;
+            hdr.flags       = MsgFlags::None;
+            hdr.payload_len = uint16_t(chunk);
+
+            size_t frame_len = frame::build(
+                cfg_.peer_mac, local_mac_, cfg_.key,
+                hdr, bytes + offset, frame_buf, rng_,
+                cfg_.padding ? cfg_.max_pad : 0
+            );
+
+            if (pcap::lib().sendpacket(handle_, frame_buf, int(frame_len)) != 0) {
+                last_error_ = std::string("sendpacket: ") + pcap::lib().geterr(handle_);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool send(const std::string& text) {
+        return send(text.data(), text.size(), MsgType::Text);
+    }
+
+    bool send_jpeg(const void* data, size_t len) {
+        return send(data, len, MsgType::Jpeg);
+    }
+
+    bool send_binary(const void* data, size_t len) {
+        return send(data, len, MsgType::Binary);
+    }
+
+    std::optional<ReceivedMessage> recv(int timeout_ms = 1000) {
+        if (!open_) return std::nullopt;
+
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(timeout_ms);
+
+        while (std::chrono::steady_clock::now() < deadline) {
+            pcap::PktHdr* pkt_hdr    = nullptr;
+            const uint8_t* pkt_data  = nullptr;
+
+            int res = pcap::lib().next_ex(handle_, &pkt_hdr, &pkt_data);
+            if (res != 1 || !pkt_data) continue;
+
+            if (pkt_hdr->caplen < TOTAL_OVERHEAD) continue;
+
+            Mac sender{};
+            frame::InnerHeader hdr{};
+            std::vector<uint8_t> payload;
+
+            if (!frame::parse(pkt_data, pkt_hdr->caplen, cfg_.key,
+                              sender, hdr, payload))
+                continue;
+
+            Mac dst;
+            std::memcpy(dst.data(), pkt_data, 6);
+            static constexpr Mac BROADCAST = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+            if (dst != local_mac_ && dst != BROADCAST) continue;
+
+            auto msg = reassembler_.add(sender, hdr, payload);
+            if (msg.has_value()) return msg;
+
+            if (++purge_counter_ % 1000 == 0)
+                reassembler_.purge();
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<ReceivedMessage> try_recv() {
+        return recv(0);
+    }
+
+    void recv_loop(std::function<bool(const ReceivedMessage&)> callback,
+                   int timeout_ms = -1) {
+        auto start = std::chrono::steady_clock::now();
+        while (open_) {
+            auto msg = recv(100);
+            if (msg.has_value()) {
+                if (!callback(*msg)) return;
+            }
+            if (timeout_ms >= 0) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (elapsed >= timeout_ms) return;
+            }
+        }
+    }
+
+private:
+    void swap(L2Channel& o) noexcept {
+        std::swap(handle_,        o.handle_);
+        std::swap(cfg_,           o.cfg_);
+        std::swap(local_mac_,     o.local_mac_);
+        std::swap(open_,          o.open_);
+        std::swap(rng_,           o.rng_);
+        std::swap(last_error_,    o.last_error_);
+        std::swap(reassembler_,   o.reassembler_);
+        std::swap(purge_counter_, o.purge_counter_);
+        uint32_t tmp = msg_counter_.load();
+        msg_counter_.store(o.msg_counter_.load());
+        o.msg_counter_.store(tmp);
+    }
+
+    pcap::Handle              handle_        = nullptr;
+    Config                    cfg_{};
+    Mac                       local_mac_{};
+    bool                      open_          = false;
+    std::mt19937              rng_;
+    std::atomic<uint32_t>     msg_counter_{0};
+    Reassembler               reassembler_;
+    std::string               last_error_;
+    uint32_t                  purge_counter_ = 0;
+};
+
+} // namespace l2

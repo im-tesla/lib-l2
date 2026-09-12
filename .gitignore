@@ -1,0 +1,40 @@
+# Visual Studio temporary & user files
+.vs/
+*.user
+*.userosv
+*.suo
+*.sln.docstates
+
+# Build outputs & intermediate directories (matches root and subdirectories)
+intermediate/
+output/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+bin/
+obj/
+
+# Compiled object files & libraries
+*.obj
+*.o
+*.lib
+*.a
+*.exp
+
+# Executables & dynamic libraries
+*.exe
+*.dll
+
+# Debugging symbols & database files
+*.pdb
+*.idb
+*.ilk
+*.iobj
+*.ipdb
+
+# MSBuild logs, recipes, and tracking
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
