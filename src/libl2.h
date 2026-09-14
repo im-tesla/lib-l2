@@ -37,6 +37,7 @@
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
 #elif defined(__linux__)
@@ -931,10 +932,21 @@ public:
             }
 
             buffers_.erase(key);
+            drop_older_than(sender, hdr.msg_id);
             return msg;
         }
 
         return std::nullopt;
+    }
+
+    void drop_older_than(const Mac& sender, uint32_t completed_msg_id) {
+        for (auto it = buffers_.begin(); it != buffers_.end(); ) {
+            if (it->first.sender == sender && (completed_msg_id - it->first.msg_id) < 0x80000000u) {
+                it = buffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     // Overload for backward compatibility with std::vector<uint8_t>
@@ -944,7 +956,8 @@ public:
         return add(sender, hdr, payload.data(), payload.size());
     }
 
-    void purge(std::chrono::seconds max_age = std::chrono::seconds(5)) {
+    template <typename Rep = int64_t, typename Period = std::milli>
+    void purge(std::chrono::duration<Rep, Period> max_age = std::chrono::milliseconds(500)) {
         if (buffers_.empty()) return;
         auto now = std::chrono::steady_clock::now();
         for (auto it = buffers_.begin(); it != buffers_.end(); ) {
@@ -1428,7 +1441,8 @@ public:
             std::memcpy(dst.data(), pkt_data, 6);
 
             // BUG-7 fix: key_multicast_ is cached instead of computed per packet
-            if (dst != local_mac_ && dst != BROADCAST_MAC &&
+            if (cfg_.peer_mac != BROADCAST_MAC &&
+                dst != local_mac_ && dst != BROADCAST_MAC &&
                 dst != GOOSE_MULTICAST_MAC && dst != key_multicast_)
                 continue;
 
@@ -1468,8 +1482,8 @@ public:
                 return msg;
             }
 
-            if (++purge_counter_ % 1000 == 0)
-                reassembler_.purge();
+            if (++purge_counter_ % 100 == 0)
+                reassembler_.purge(std::chrono::milliseconds(250));
 
         } while (timeout_ms > 0 && std::chrono::steady_clock::now() < deadline);
 
