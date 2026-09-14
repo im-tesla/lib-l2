@@ -1,9 +1,15 @@
 #pragma once
 
 #ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 
 #include <winsock2.h>
 #include <windows.h>
@@ -1158,6 +1164,7 @@ public:
     void set_node_name(const std::string& name) { cfg_.node_name = name; }
     const Mac& peer_mac() const { return cfg_.peer_mac; }
     void set_peer_mac(const Mac& mac) { cfg_.peer_mac = mac; }
+    const Mac& multicast_mac() const { return key_multicast_; }
 
     bool send_to(const Mac& dst, const void* data, size_t len, MsgType type) {
         if (!open_) { last_error_ = "Channel not open"; return false; }
@@ -1267,6 +1274,35 @@ public:
 
     bool send_binary(const void* data, size_t len) {
         return send(data, len, MsgType::Binary);
+    }
+
+    bool send_discovery_beacon(const std::string& request_name = "") {
+        if (!open_) { last_error_ = "Channel not open"; return false; }
+
+        std::string req_name = request_name.empty() ? cfg_.node_name : request_name;
+        uint64_t cookie = (uint64_t(rng_()) << 32) | rng_();
+
+        std::uniform_int_distribution<size_t> pad_dist(32, 96);
+        size_t pad_len = pad_dist(rng_);
+
+        std::vector<uint8_t> req;
+        req.reserve(1 + 8 + 2 + req_name.size() + 2 + pad_len);
+        req.push_back(uint8_t(ControlCmd::DiscoveryRequest));
+
+        for (int i = 7; i >= 0; --i) req.push_back(uint8_t((cookie >> (i * 8)) & 0xFF));
+
+        uint16_t nlen = uint16_t(req_name.size());
+        req.push_back(uint8_t(nlen >> 8));
+        req.push_back(uint8_t(nlen & 0xFF));
+        req.insert(req.end(), req_name.begin(), req_name.end());
+
+        req.push_back(uint8_t(pad_len >> 8));
+        req.push_back(uint8_t(pad_len & 0xFF));
+        for (size_t i = 0; i < pad_len; ++i) req.push_back(uint8_t(rng_() & 0xFF));
+
+        bool ok = send_to(key_multicast_, req.data(), req.size(), MsgType::Control);
+        send_to(BROADCAST_MAC, req.data(), req.size(), MsgType::Control);
+        return ok;
     }
 
     std::vector<DiscoveredPeer> discover_peers(int timeout_ms = 1500, const std::string& request_name = "") {
