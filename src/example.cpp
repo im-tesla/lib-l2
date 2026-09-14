@@ -91,6 +91,7 @@ static int resolve_adapter(const std::vector<l2::AdapterInfo>& adapters, const s
 }
 
 static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* peer, bool random_mac) {
+    l2::platform::ScopedLatencyTuning tuning;
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
     cfg.adapter    = adapters[idx].name;
@@ -174,6 +175,7 @@ static int mode_send(const std::vector<l2::AdapterInfo>& adapters, int idx, cons
 }
 
 static int mode_recv(const std::vector<l2::AdapterInfo>& adapters, int idx, const char* node_name, bool random_mac) {
+    l2::platform::ScopedLatencyTuning tuning;
     l2::L2Channel ch;
     l2::L2Channel::Config cfg;
     cfg.adapter              = adapters[idx].name;
